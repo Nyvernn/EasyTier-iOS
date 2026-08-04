@@ -108,6 +108,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             Double(sample.footprint) / (50.0 * mib) * 100.0
         )
         logger.warning("\(line, privacy: .public)")
+        sendTelemetry(line)
     }
 
     private func startMemoryProbe() {
@@ -241,6 +242,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 Double(self.stressBytesIn) / 1048576.0
             )
             logger.warning("\(line, privacy: .public)")
+            self.sendTelemetry(line)
             self.logMemory("stressEnd-c\(concurrency)")
             self.runStressStage(index + 1, target: target)
         }
@@ -280,6 +282,98 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         closeStressConnections()
         logMemory("stressDone")
         logger.warning("stress finished, returning to idle sampling")
+    }
+
+    // MARK: - Configuration channels
+    //
+    // Configuration reaches this extension by two routes, and both have to be tried:
+    //
+    //   1. VPNConfig in the App Group container -- upstream's only channel. Re-signing
+    //      the IPA with a third-party shared certificate invalidates the
+    //      group.cn.easytier entitlement, after which UserDefaults(suiteName:) no
+    //      longer resolves to a shared container and this route is simply gone.
+    //   2. providerConfiguration -- a dictionary carried by NETunnelProviderProtocol,
+    //      persisted by the system alongside the VPN configuration itself. It does not
+    //      involve the App Group, so it still works on a re-signed build.
+    //
+    // Losing route 1 used to fail in the worst possible way: everything that would
+    // have reported it lives in the same container (the error hand-back, the Rust log
+    // file, the OSLog export), so the only symptom was a VPN icon blinking once.
+    //
+    // Deliberately NOT hardcoding network credentials as a fallback: this is a public
+    // repository, and a committed network_secret would let anyone join the overlay --
+    // where members can not only borrow the exit but also reach the host's RDP port.
+    private func loadOptions() -> EasyTierOptions? {
+        if let data = UserDefaults(suiteName: APP_GROUP_ID)?.data(forKey: "VPNConfig"),
+           let decoded = try? JSONDecoder().decode(EasyTierOptions.self, from: data) {
+            logger.info("loadOptions() read from App Group")
+            return decoded
+        }
+
+        guard let tunnelProtocol = protocolConfiguration as? NETunnelProviderProtocol,
+              let raw = tunnelProtocol.providerConfiguration?["options"] else {
+            return nil
+        }
+        // The system round-trips providerConfiguration values through its own
+        // serialisation, so a Data may come back as a base64 string.
+        let data: Data?
+        if let direct = raw as? Data {
+            data = direct
+        } else if let text = raw as? String {
+            data = Data(base64Encoded: text) ?? text.data(using: .utf8)
+        } else {
+            data = nil
+        }
+        guard let data,
+              let decoded = try? JSONDecoder().decode(EasyTierOptions.self, from: data) else {
+            logger.error("loadOptions() providerConfiguration present but not decodable")
+            return nil
+        }
+        logger.warning("loadOptions() App Group unreadable, fell back to providerConfiguration")
+        return decoded
+    }
+
+    // MARK: - Telemetry over the tunnel
+    //
+    // With the App Group gone, both log sinks land in a container nobody can read, so
+    // the measurements are shipped straight to the peer instead. This also doubles as
+    // a liveness check on the tunnel itself: telemetry arriving at all proves the
+    // overlay carries traffic.
+    //
+    // UDP on purpose -- it is stateless, so losing a sample or two costs nothing and
+    // there is no reconnect logic to maintain inside a memory-constrained process.
+    private static let telemetryTarget = "192.168.65.254:8897"
+    private var telemetryConnection: NWConnection?
+
+    private static func parseHostPort(_ raw: String) -> (host: String, port: UInt16)? {
+        guard let separator = raw.lastIndex(of: ":") else { return nil }
+        let host = String(raw[raw.startIndex..<separator])
+        guard !host.isEmpty, let port = UInt16(raw[raw.index(after: separator)...]) else {
+            return nil
+        }
+        return (host, port)
+    }
+
+    private func sendTelemetry(_ line: String) {
+        if telemetryConnection == nil {
+            guard let target = PacketTunnelProvider.parseHostPort(
+                PacketTunnelProvider.telemetryTarget
+            ), let port = NWEndpoint.Port(rawValue: target.port) else { return }
+            let conn = NWConnection(
+                to: .hostPort(host: NWEndpoint.Host(target.host), port: port),
+                using: .udp
+            )
+            conn.start(queue: settingsQueue)
+            telemetryConnection = conn
+        }
+        guard let conn = telemetryConnection,
+              let data = (line + "\n").data(using: .utf8) else { return }
+        conn.send(content: data, completion: .idempotent)
+    }
+
+    private func closeTelemetry() {
+        telemetryConnection?.cancel()
+        telemetryConnection = nil
     }
 
     private func resetTunnelSessionState() {
@@ -583,11 +677,12 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             self.pendingStartCompletion = .init(generation: generation, completion: completion)
             PacketTunnelProvider.current = self
 
-            let defaults = UserDefaults(suiteName: APP_GROUP_ID)
-            guard let configData = defaults?.data(forKey: "VPNConfig"),
-                  let options = try? JSONDecoder().decode(EasyTierOptions.self, from: configData) else {
-                let message = "options is nil"
-                logger.error("startTunnel() options is nil")
+            guard let options = self.loadOptions() else {
+                // Both channels came up empty. Note this point is still ahead of
+                // initRustLogger, so nothing below .warning would survive anywhere --
+                // hence the explicit message rather than the original "options is nil".
+                let message = "no configuration: App Group unreadable and providerConfiguration empty"
+                logger.error("startTunnel() \(message, privacy: .public)")
                 self.notifyHostAppError(message)
                 self.failStart(generation: generation, error: message, stopNetwork: false)
                 return
@@ -632,6 +727,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         settingsQueue.async {
             self.finishStress()
             self.stopMemoryProbe()
+            self.closeTelemetry()
             self.tunnelGeneration &+= 1
             self.activeTunnelGeneration = nil
             let pendingStartCompletion = self.pendingStartCompletion

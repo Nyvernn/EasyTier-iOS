@@ -218,6 +218,15 @@ class NetworkExtensionManager: NetworkExtensionManagerProtocol {
         return options
     }
     
+    // Mirror of the last encoded options, handed to the tunnel through
+    // providerConfiguration on connect. The App Group route alone is not dependable:
+    // re-signing the IPA with a third-party certificate voids the
+    // group.cn.easytier entitlement, and then the extension cannot read VPNConfig at
+    // all. providerConfiguration is persisted by the system with the VPN configuration
+    // itself, so it survives that. Kept in memory only -- it is just a relay between
+    // saveOptions() and the next connect() in the same process.
+    nonisolated(unsafe) private static var lastOptionsData: Data?
+
     static func saveOptions(_ options: EasyTierOptions) {
         // Save config to App Group for Widget use
         let defaults = UserDefaults(suiteName: APP_GROUP_ID)
@@ -225,6 +234,7 @@ class NetworkExtensionManager: NetworkExtensionManagerProtocol {
             logger.debug("save options: \(configData.string ?? "nil")")
             defaults?.set(configData, forKey: "VPNConfig")
             defaults?.synchronize()
+            lastOptionsData = configData
         }
     }
     
@@ -244,6 +254,14 @@ class NetworkExtensionManager: NetworkExtensionManagerProtocol {
         guard let manager else {
             Self.logger.error("connect() failed: manager is nil")
             return
+        }
+
+        // Give the tunnel a second way to read its configuration; see lastOptionsData.
+        // connectWithManager() calls saveToPreferences() right after configuring the
+        // manager, so this gets persisted along with everything else.
+        if let optionsData = Self.lastOptionsData,
+           let tunnelProtocol = manager.protocolConfiguration as? NETunnelProviderProtocol {
+            tunnelProtocol.providerConfiguration = ["options": optionsData]
         }
 
         do {
