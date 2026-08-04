@@ -135,6 +135,153 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         memoryProbeStartedAt = nil
     }
 
+    // MARK: - Load generator
+    //
+    // Waiting for ordinary usage to reveal the ceiling is too slow and misses the
+    // point: the dominant memory cost is the number of concurrent connections (each
+    // carries its own send/receive buffers), and a browser only opens 6-8 of them.
+    //
+    // So once the tunnel is up we drive a staged load through it, stepping the
+    // concurrency up and sampling footprint at every step. The resulting
+    // concurrency-to-memory curve is what tells us how much headroom is left for a
+    // tun->socks5 stack later, and it is also what pins down the buffer sizes and
+    // connection caps that such a stack has to be compiled with.
+    //
+    // The target needs to be a TCP service on the far side that keeps echoing, and
+    // defaults to the host address exposed through EasyTier's subnet proxy. Override
+    // it by writing StressTarget ("host:port") into the App Group defaults. The run
+    // stops by itself after the last stage -- roughly three minutes total -- and
+    // sampling then continues at the idle interval.
+    private static let stressStages: [Int] = [8, 32, 96, 192]
+    private static let stressStageSeconds: TimeInterval = 40
+    private static let stressStartDelaySeconds: TimeInterval = 45
+    private static let stressPayload = Data(count: 4096)
+    private static let stressDefaultTarget = "192.168.65.254:8899"
+
+    private var stressConnections: [NWConnection] = []
+    private var stressActive = false
+    private var stressBytesOut: UInt64 = 0
+    private var stressBytesIn: UInt64 = 0
+    private var stressReady = 0
+    private var stressFailed = 0
+
+    // All NWConnection callbacks below are delivered on settingsQueue (see the
+    // conn.start(queue:) call), which is also where the counters are mutated, so no
+    // further synchronisation is needed.
+    private func parseStressTarget() -> (host: String, port: UInt16)? {
+        let raw = UserDefaults(suiteName: APP_GROUP_ID)?.string(forKey: "StressTarget")
+            ?? PacketTunnelProvider.stressDefaultTarget
+        guard let separator = raw.lastIndex(of: ":") else { return nil }
+        let host = String(raw[raw.startIndex..<separator])
+        guard !host.isEmpty, let port = UInt16(raw[raw.index(after: separator)...]) else {
+            return nil
+        }
+        return (host, port)
+    }
+
+    private func scheduleStressTest() {
+        settingsQueue.asyncAfter(
+            deadline: .now() + PacketTunnelProvider.stressStartDelaySeconds
+        ) { [weak self] in
+            guard let self, self.activeTunnelGeneration != nil, !self.stressActive else { return }
+            guard let target = self.parseStressTarget() else {
+                logger.warning("stress skipped: StressTarget is not a valid host:port")
+                return
+            }
+            self.stressActive = true
+            let line = "stress begin target=\(target.host):\(target.port) stages=\(PacketTunnelProvider.stressStages)"
+            logger.warning("\(line, privacy: .public)")
+            self.runStressStage(0, target: target)
+        }
+    }
+
+    private func runStressStage(_ index: Int, target: (host: String, port: UInt16)) {
+        guard stressActive, activeTunnelGeneration != nil,
+              index < PacketTunnelProvider.stressStages.count,
+              let port = NWEndpoint.Port(rawValue: target.port) else {
+            finishStress()
+            return
+        }
+
+        closeStressConnections()
+        stressReady = 0
+        stressFailed = 0
+        let concurrency = PacketTunnelProvider.stressStages[index]
+        logMemory("stressBegin-c\(concurrency)")
+
+        let endpoint = NWEndpoint.hostPort(host: NWEndpoint.Host(target.host), port: port)
+        for _ in 0..<concurrency {
+            let conn = NWConnection(to: endpoint, using: .tcp)
+            conn.stateUpdateHandler = { [weak self] state in
+                guard let self, self.stressActive else { return }
+                switch state {
+                case .ready:
+                    self.stressReady += 1
+                    self.pumpStress(conn)
+                case .failed, .cancelled:
+                    self.stressFailed += 1
+                default:
+                    break
+                }
+            }
+            stressConnections.append(conn)
+            conn.start(queue: settingsQueue)
+        }
+
+        settingsQueue.asyncAfter(
+            deadline: .now() + PacketTunnelProvider.stressStageSeconds
+        ) { [weak self] in
+            guard let self else { return }
+            let line = String(
+                format: "stressEnd-c%d ready=%d failed=%d out=%.1fMiB in=%.1fMiB",
+                concurrency,
+                self.stressReady,
+                self.stressFailed,
+                Double(self.stressBytesOut) / 1048576.0,
+                Double(self.stressBytesIn) / 1048576.0
+            )
+            logger.warning("\(line, privacy: .public)")
+            self.logMemory("stressEnd-c\(concurrency)")
+            self.runStressStage(index + 1, target: target)
+        }
+    }
+
+    private func pumpStress(_ conn: NWConnection) {
+        guard stressActive else { return }
+        conn.send(
+            content: PacketTunnelProvider.stressPayload,
+            completion: .contentProcessed { [weak self] error in
+                guard let self, self.stressActive, error == nil else { return }
+                self.stressBytesOut += UInt64(PacketTunnelProvider.stressPayload.count)
+                conn.receive(minimumIncompleteLength: 1, maximumLength: 32768) {
+                    [weak self] data, _, isComplete, error in
+                    guard let self, self.stressActive else { return }
+                    if let data, !data.isEmpty {
+                        self.stressBytesIn += UInt64(data.count)
+                    }
+                    guard error == nil, !isComplete else { return }
+                    self.pumpStress(conn)
+                }
+            }
+        )
+    }
+
+    private func closeStressConnections() {
+        for conn in stressConnections {
+            conn.stateUpdateHandler = nil
+            conn.cancel()
+        }
+        stressConnections.removeAll()
+    }
+
+    private func finishStress() {
+        guard stressActive else { return }
+        stressActive = false
+        closeStressConnections()
+        logMemory("stressDone")
+        logger.warning("stress finished, returning to idle sampling")
+    }
+
     private func resetTunnelSessionState() {
         lastOptions = nil
         lastAppliedSettings = nil
@@ -473,6 +620,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                     self.failStart(generation: generation, error: error, stopNetwork: true)
                 } else {
                     self.startMemoryProbe()
+                    self.scheduleStressTest()
                     self.completeStart(generation: generation, error: nil)
                 }
             }
@@ -482,6 +630,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     override func stopTunnel(with reason: NEProviderStopReason, completionHandler: @escaping () -> Void) {
         logger.warning("stopTunnel(): triggered")
         settingsQueue.async {
+            self.finishStress()
             self.stopMemoryProbe()
             self.tunnelGeneration &+= 1
             self.activeTunnelGeneration = nil
