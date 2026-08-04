@@ -52,6 +52,89 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     private var lastAppliedSettings: TunnelNetworkSettingsSnapshot?
     private var needReapplySettings: Bool = false
 
+    // MARK: - Memory probe
+    //
+    // iOS enforces a fixed per-process memory budget on a packet tunnel provider and
+    // has jetsam kill it on breach. The kill is silent: no crash log is produced, the
+    // host app survives, and the user only sees the tunnel drop. Apple DTS has quoted
+    // 50 MiB for iOS 15/16 on the developer forums, but that figure is undocumented,
+    // has moved across releases (5 -> 15 -> 50), and nothing is published for iOS 17
+    // or later -- so it has to be measured on the target device, never assumed.
+    //
+    // We sample phys_footprint, which is the same ledger jetsam charges against and
+    // the reason resident_size alone would be misleading. Logging it on a timer lets
+    // a long session show how much headroom the EasyTier core actually leaves before
+    // any further component is linked into this same process.
+    private static let memoryProbeInterval: TimeInterval = 15
+    private var memoryProbeTimer: DispatchSourceTimer?
+    private var memoryPeakBytes: UInt64 = 0
+    private var memoryProbeStartedAt: Date?
+
+    private static func sampleMemory() -> (footprint: UInt64, resident: UInt64)? {
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(
+            MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<natural_t>.size
+        )
+        let result = withUnsafeMutablePointer(to: &info) { infoPtr in
+            infoPtr.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { intPtr in
+                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), intPtr, &count)
+            }
+        }
+        guard result == KERN_SUCCESS else { return nil }
+        return (UInt64(info.phys_footprint), info.resident_size)
+    }
+
+    // Emitted at .warning on purpose: OSLog does not persist .info or .debug, so
+    // anything logged below .warning would be gone by the time the log is exported.
+    private func logMemory(_ tag: String) {
+        guard let sample = PacketTunnelProvider.sampleMemory() else {
+            logger.error("memProbe(\(tag, privacy: .public)) task_info failed")
+            return
+        }
+        if sample.footprint > memoryPeakBytes {
+            memoryPeakBytes = sample.footprint
+        }
+        let mib = 1024.0 * 1024.0
+        let elapsed = memoryProbeStartedAt.map { Int(Date().timeIntervalSince($0)) } ?? 0
+        // pctOf50MiB is a reading aid only; nothing branches on it, precisely because
+        // the real budget is undocumented and varies by iOS version.
+        let line = String(
+            format: "memProbe(%@) t=%lds footprint=%.2fMiB peak=%.2fMiB resident=%.2fMiB pctOf50MiB=%.1f%%",
+            tag,
+            elapsed,
+            Double(sample.footprint) / mib,
+            Double(memoryPeakBytes) / mib,
+            Double(sample.resident) / mib,
+            Double(sample.footprint) / (50.0 * mib) * 100.0
+        )
+        logger.warning("\(line, privacy: .public)")
+    }
+
+    private func startMemoryProbe() {
+        stopMemoryProbe()
+        memoryProbeStartedAt = Date()
+        memoryPeakBytes = 0
+        logMemory("start")
+        let timer = DispatchSource.makeTimerSource(queue: settingsQueue)
+        timer.schedule(
+            deadline: .now() + PacketTunnelProvider.memoryProbeInterval,
+            repeating: PacketTunnelProvider.memoryProbeInterval
+        )
+        timer.setEventHandler { [weak self] in
+            self?.logMemory("tick")
+        }
+        timer.resume()
+        memoryProbeTimer = timer
+    }
+
+    private func stopMemoryProbe() {
+        guard memoryProbeTimer != nil else { return }
+        logMemory("stop")
+        memoryProbeTimer?.cancel()
+        memoryProbeTimer = nil
+        memoryProbeStartedAt = nil
+    }
+
     private func resetTunnelSessionState() {
         lastOptions = nil
         lastAppliedSettings = nil
@@ -290,6 +373,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                         }
                     }
                     logger.info("applyNetworkSettings() settings applied")
+                    self.logMemory("settingsApplied")
                     self.finishNetworkSettingsApply(
                         generation: generation,
                         snapshot: newSnapshot,
@@ -388,6 +472,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 if let error {
                     self.failStart(generation: generation, error: error, stopNetwork: true)
                 } else {
+                    self.startMemoryProbe()
                     self.completeStart(generation: generation, error: nil)
                 }
             }
@@ -397,6 +482,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     override func stopTunnel(with reason: NEProviderStopReason, completionHandler: @escaping () -> Void) {
         logger.warning("stopTunnel(): triggered")
         settingsQueue.async {
+            self.stopMemoryProbe()
             self.tunnelGeneration &+= 1
             self.activeTunnelGeneration = nil
             let pendingStartCompletion = self.pendingStartCompletion
