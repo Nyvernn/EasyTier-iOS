@@ -141,6 +141,12 @@ public enum ProviderCommand: String, Codable, CaseIterable {
     case exportOSLog = "export_oslog"
     case runningInfo = "running_info"
     case lastNetworkSettings = "last_network_settings"
+    // Returns diagnostics as plain UTF-8 text in the reply body, rather than a path
+    // into the App Group container the way exportOSLog does. On a re-signed build that
+    // container is unreachable, which takes out every other way of getting logs off
+    // the device -- so this one deliberately depends on nothing but the provider
+    // message channel itself.
+    case diagnostics = "diagnostics"
 }
 
 public enum TunnelManagerError: LocalizedError {

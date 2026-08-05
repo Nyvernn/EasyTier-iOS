@@ -9,6 +9,49 @@ let loggerSubsystem = "\(APP_BUNDLE_ID).tunnel"
 let debounceInterval = 0.5
 let logger = Logger(subsystem: loggerSubsystem, category: "swift")
 
+/// In-process ring buffer, retrievable through the `diagnostics` provider message.
+///
+/// Every other way of getting logs off the device is unavailable on a re-signed
+/// build: the Rust log file and the OSLog export both live in the App Group
+/// container, whose entitlement a third-party certificate invalidates, and telemetry
+/// over the overlay cannot help diagnose the overlay itself. That coupling between
+/// the diagnostic channel and the thing being diagnosed is what this avoids -- it
+/// depends on nothing but the provider message channel.
+final class DiagnosticsLog {
+    static let shared = DiagnosticsLog()
+
+    private let lock = NSLock()
+    private var lines: [String] = []
+    private let limit = 4000
+    private let startedAt = Date()
+
+    func append(_ message: String) {
+        let elapsed = String(format: "%8.2f", Date().timeIntervalSince(startedAt))
+        lock.lock()
+        lines.append("[\(elapsed)] \(message)")
+        if lines.count > limit {
+            lines.removeFirst(lines.count - limit)
+        }
+        lock.unlock()
+    }
+
+    func dump() -> String {
+        lock.lock()
+        let snapshot = lines
+        lock.unlock()
+        return snapshot.joined(separator: "\n")
+    }
+}
+
+/// Log to OSLog and to the retrievable buffer at once.
+///
+/// `.warning` because OSLog drops `.info` and `.debug` without persisting them, so
+/// anything below that would be gone by the time a properly signed build exports it.
+func dlog(_ message: String) {
+    logger.warning("\(message, privacy: .public)")
+    DiagnosticsLog.shared.append(message)
+}
+
 private struct ProviderMessageResponse: Codable {
     let ok: Bool
     let path: String?
@@ -107,7 +150,10 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             Double(sample.resident) / mib,
             Double(sample.footprint) / (50.0 * mib) * 100.0
         )
-        logger.warning("\(line, privacy: .public)")
+        // Into the retrievable buffer as well as out over the network: telemetry can be
+        // lost to a routing problem, and the measurements are the whole point -- they
+        // must not depend solely on the channel that is itself under suspicion.
+        dlog(line)
         sendTelemetry(line)
     }
 
@@ -115,6 +161,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         stopMemoryProbe()
         memoryProbeStartedAt = Date()
         memoryPeakBytes = 0
+        dlog("startMemoryProbe() interval=\(PacketTunnelProvider.memoryProbeInterval)s")
         logMemory("start")
         let timer = DispatchSource.makeTimerSource(queue: settingsQueue)
         timer.schedule(
@@ -186,12 +233,12 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         ) { [weak self] in
             guard let self, self.activeTunnelGeneration != nil, !self.stressActive else { return }
             guard let target = self.parseStressTarget() else {
-                logger.warning("stress skipped: StressTarget is not a valid host:port")
+                dlog("stress skipped: StressTarget is not a valid host:port")
                 return
             }
             self.stressActive = true
             let line = "stress begin target=\(target.host):\(target.port) stages=\(PacketTunnelProvider.stressStages)"
-            logger.warning("\(line, privacy: .public)")
+            dlog(line)
             self.runStressStage(0, target: target)
         }
     }
@@ -219,7 +266,16 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 case .ready:
                     self.stressReady += 1
                     self.pumpStress(conn)
-                case .failed, .cancelled:
+                case .failed(let error):
+                    self.stressFailed += 1
+                    // First few only -- with 192 connections failing for one shared
+                    // reason, the rest add nothing but noise.
+                    if self.stressFailed <= 3 {
+                        DiagnosticsLog.shared.append(
+                            "stress conn failed (#\(self.stressFailed)): \(error)"
+                        )
+                    }
+                case .cancelled:
                     self.stressFailed += 1
                 default:
                     break
@@ -241,7 +297,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 Double(self.stressBytesOut) / 1048576.0,
                 Double(self.stressBytesIn) / 1048576.0
             )
-            logger.warning("\(line, privacy: .public)")
+            dlog(line)
             self.sendTelemetry(line)
             self.logMemory("stressEnd-c\(concurrency)")
             self.runStressStage(index + 1, target: target)
@@ -306,7 +362,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     private func loadOptions() -> EasyTierOptions? {
         if let data = UserDefaults(suiteName: APP_GROUP_ID)?.data(forKey: "VPNConfig"),
            let decoded = try? JSONDecoder().decode(EasyTierOptions.self, from: data) {
-            logger.info("loadOptions() read from App Group")
+            dlog("loadOptions() read from App Group")
             return decoded
         }
 
@@ -329,7 +385,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             logger.error("loadOptions() providerConfiguration present but not decodable")
             return nil
         }
-        logger.warning("loadOptions() App Group unreadable, fell back to providerConfiguration")
+        dlog("loadOptions() App Group unreadable -> fell back to providerConfiguration")
         return decoded
     }
 
@@ -344,6 +400,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     // there is no reconnect logic to maintain inside a memory-constrained process.
     private static let telemetryTarget = "192.168.65.254:8897"
     private var telemetryConnection: NWConnection?
+    private var telemetryErrorCount = 0
 
     private static func parseHostPort(_ raw: String) -> (host: String, port: UInt16)? {
         guard let separator = raw.lastIndex(of: ":") else { return nil }
@@ -363,12 +420,27 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 to: .hostPort(host: NWEndpoint.Host(target.host), port: port),
                 using: .udp
             )
+            conn.stateUpdateHandler = { state in
+                // Even UDP reports state here, and "waiting" with a routing error is
+                // exactly the signature of the route never having been installed.
+                DiagnosticsLog.shared.append("telemetry conn state: \(state)")
+            }
             conn.start(queue: settingsQueue)
             telemetryConnection = conn
+            dlog("telemetry opened to \(target.host):\(target.port)")
         }
         guard let conn = telemetryConnection,
               let data = (line + "\n").data(using: .utf8) else { return }
-        conn.send(content: data, completion: .idempotent)
+        conn.send(content: data, completion: .contentProcessed { [weak self] error in
+            guard let self, let error else { return }
+            // Only the first few: the failure mode is identical every time, and one
+            // entry per 15s sample would bury everything else in the buffer.
+            guard self.telemetryErrorCount < 3 else { return }
+            self.telemetryErrorCount += 1
+            DiagnosticsLog.shared.append(
+                "telemetry send failed (#\(self.telemetryErrorCount)): \(error)"
+            )
+        })
     }
 
     private func closeTelemetry() {
@@ -536,8 +608,19 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
 
             let settings = buildSettings(options)
             let newSnapshot = self.snapshotSettings(settings)
+            // Reachability of a proxied subnet (the peer's 192.168.65.254, say) hinges
+            // entirely on what lands in includedRoutes here: without a matching entry
+            // iOS never hands those packets to the tun device, and they leak out over
+            // cellular to an address that does not exist there. So log verbatim what
+            // actually got applied.
+            let appliedRoutes = (settings.ipv4Settings?.includedRoutes ?? [])
+                .map { "\($0.destinationAddress)/\($0.destinationSubnetMask)" }
+                .joined(separator: ", ")
+            dlog("applyNetworkSettings() addrs=\(settings.ipv4Settings?.addresses ?? []) includedRoutes=[\(appliedRoutes)]")
             if newSnapshot == self.lastAppliedSettings {
-                logger.warning("applyNetworkSettings() new settings are exactly the same as last applied, skipping")
+                // Worth flagging loudly: if the snapshot type does not cover routes,
+                // a route-only update would be mistaken for "no change" and dropped.
+                dlog("applyNetworkSettings() snapshot unchanged -> SKIPPING re-apply")
                 self.finishNetworkSettingsApply(
                     generation: generation,
                     snapshot: newSnapshot,
@@ -688,6 +771,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 return
             }
             self.lastOptions = options
+            dlog("startTunnel() options ipv4=\(options.ipv4 ?? "-") mtu=\(options.mtu.map(String.init) ?? "-") manualRoutes=\(options.routes.count) configBytes=\(options.config.count) logLevel=\(options.logLevel.rawValue)")
 
             initRustLogger(level: options.logLevel)
             var errPtr: UnsafePointer<CChar>? = nil
@@ -788,6 +872,19 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 } else {
                     completionHandler(nil)
                 }
+            case .diagnostics:
+                var text = DiagnosticsLog.shared.dump()
+                // Append the Rust log too: whether easytier reached a relay and
+                // whether it learned the peer's proxy CIDRs is only known over there,
+                // and that is exactly what the routing question hinges on.
+                if let path = rustLogPath,
+                   let content = try? String(contentsOfFile: path, encoding: .utf8) {
+                    let tail = content.split(separator: "\n").suffix(400).joined(separator: "\n")
+                    text += "\n\n===== rust log, last 400 lines @ \(path) =====\n\(tail)"
+                } else {
+                    text += "\n\n===== rust log unavailable (path=\(rustLogPath ?? "nil")) ====="
+                }
+                completionHandler(text.data(using: .utf8))
             case .lastNetworkSettings:
                 settingsQueue.async { [weak self] in
                     guard let lastAppliedSettings = self?.lastAppliedSettings else {

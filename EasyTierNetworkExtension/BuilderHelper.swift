@@ -68,7 +68,12 @@ func buildIPv4Routes(info: RunningInfo?, options: EasyTierOptions) -> [NEIPv4Rou
             }
         }
     } else {
+        // This is the only source of proxied-subnet routes, so make its contents
+        // visible: if the peer's proxy CIDRs have not propagated into runningInfo yet,
+        // no route for them gets installed and traffic there silently goes nowhere.
         if let routes = info?.routes {
+            let proxyCIDRs = routes.flatMap { $0.proxyCIDRs }
+            dlog("buildIPv4Routes() runningInfo routes=\(routes.count) proxyCIDRs=\(proxyCIDRs)")
             for route in routes {
                 for cidr in route.proxyCIDRs {
                     if let normalized = normalizeCIDR(cidr) {
@@ -76,6 +81,8 @@ func buildIPv4Routes(info: RunningInfo?, options: EasyTierOptions) -> [NEIPv4Rou
                     }
                 }
             }
+        } else {
+            dlog("buildIPv4Routes() runningInfo is nil -- no proxied-subnet routes available")
         }
         if let ipv4 = options.ipv4, let cidr = RunningIPv4CIDR(from: ipv4) {
             cidrs.insert(.init(address: ipv4MaskedSubnet(cidr), length: cidr.networkLength))

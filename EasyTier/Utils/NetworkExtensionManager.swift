@@ -27,6 +27,7 @@ protocol NetworkExtensionManagerProtocol: ObservableObject {
     func updateName(name: String, server: String) async
     func clearCoreLog() async throws
     func exportExtensionLogs() async throws -> URL
+    func fetchDiagnostics() async throws -> URL
     @MainActor
     func setAlwaysOnEnabled(_ enabled: Bool) async throws
 }
@@ -355,6 +356,44 @@ class NetworkExtensionManager: NetworkExtensionManagerProtocol {
         }
     }
 
+    /// Fetch diagnostics as text and write it into the app's own temporary directory.
+    ///
+    /// Deliberately unlike exportExtensionLogs(), which asks the extension for a *path*
+    /// inside the App Group container: on a re-signed build that container is
+    /// unreachable from both sides, so that route yields nothing at all. Here the
+    /// extension returns the content itself over the provider message channel and the
+    /// app owns the resulting file, keeping the whole path clear of the App Group.
+    func fetchDiagnostics() async throws -> URL {
+        guard let manager,
+              let session = manager.connection as? NETunnelProviderSession,
+              session.status == .connected else {
+            throw NEManagerError.providerUnavailable
+        }
+        guard let message = ProviderCommand.diagnostics.rawValue.data(using: .utf8) else {
+            throw NEManagerError.invalidResponse
+        }
+        let text: String = try await withCheckedThrowingContinuation { continuation in
+            do {
+                try session.sendProviderMessage(message) { data in
+                    guard let data, let text = String(data: data, encoding: .utf8) else {
+                        continuation.resume(throwing: NEManagerError.invalidResponse)
+                        return
+                    }
+                    continuation.resume(returning: text)
+                }
+            } catch {
+                continuation.resume(throwing: error)
+            }
+        }
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("easytier-diagnostics.txt")
+        guard let data = text.data(using: .utf8) else {
+            throw NEManagerError.invalidResponse
+        }
+        try data.write(to: url, options: .atomic)
+        return url
+    }
+
     func exportExtensionLogs() async throws -> URL {
         guard let manager,
               let session = manager.connection as? NETunnelProviderSession,
@@ -486,6 +525,10 @@ class MockNEManager: NetworkExtensionManagerProtocol {
     }
 
     func exportExtensionLogs() async throws -> URL {
+        throw NetworkExtensionManager.NEManagerError.providerUnavailable
+    }
+
+    func fetchDiagnostics() async throws -> URL {
         throw NetworkExtensionManager.NEManagerError.providerUnavailable
     }
 

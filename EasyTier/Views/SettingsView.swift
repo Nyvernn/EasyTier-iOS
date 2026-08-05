@@ -29,6 +29,7 @@ struct SettingsView<Manager: NetworkExtensionManagerProtocol>: View {
 #endif
     @State private var settingsErrorMessage: TextItem?
     @State private var isExporting = false
+    @State private var isExportingDiagnostics = false
     @State private var isAlwaysOnUpdating = false
     @State private var isProfileStorageUpdating = false
     @State private var pendingProfileStorageTransition: PendingProfileStorageTransition?
@@ -210,6 +211,23 @@ struct SettingsView<Manager: NetworkExtensionManagerProtocol>: View {
                         }
                     }
                 }
+                // Separate from export_oslog on purpose: that one hands back a path
+                // inside the App Group container, which a re-signed build cannot reach
+                // from either side. This one carries the text back over the provider
+                // message channel, so it works even when the container does not.
+                Button(action: {
+                    exportDiagnostics()
+                }) {
+                    HStack {
+                        Text(verbatim: "Export diagnostics")
+                        Spacer()
+                        if isExportingDiagnostics {
+#if os(iOS)
+                            ProgressView()
+#endif
+                        }
+                    }
+                }
 #if os(macOS)
                 .buttonStyle(.borderless)
                 .tint(.accentColor)
@@ -363,6 +381,37 @@ struct SettingsView<Manager: NetworkExtensionManagerProtocol>: View {
             }
         }
         .navigationTitle("about.license")
+    }
+
+    private func exportDiagnostics() {
+        guard !isExportingDiagnostics else { return }
+        isExportingDiagnostics = true
+        Task {
+            do {
+                let url = try await manager.fetchDiagnostics()
+                await MainActor.run {
+#if os(iOS)
+                    exportURL = url
+                    isExportPresented = true
+#elseif os(macOS)
+                    do {
+                        try saveExportedFileToDisk(url)
+                    } catch {
+                        settingsErrorMessage = .init(error.localizedDescription)
+                    }
+#endif
+                }
+            } catch {
+                await MainActor.run {
+                    // Surface the raw error rather than a generic string: the failure
+                    // reason is the point of this button.
+                    settingsErrorMessage = .init(String(describing: error))
+                }
+            }
+            await MainActor.run {
+                isExportingDiagnostics = false
+            }
+        }
     }
 
     private func exportOSLog() {

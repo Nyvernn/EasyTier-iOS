@@ -113,14 +113,24 @@ func setNonBlocking(fd: Int32) -> Bool {
     return true
 }
 
+/// Where the Rust log actually ended up, so the `diagnostics` command can attach it.
+nonisolated(unsafe) var rustLogPath: String?
+
 func initRustLogger(level: LogLevel) {
-    guard let containerURL = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: APP_GROUP_ID) else {
-        logger.error("initRustLogger() failed: App Group container not found")
-        return
-    }
-    let path = containerURL.appendingPathComponent(LOG_FILENAME).path
-    logger.info("initRustLogger() write to: \(path, privacy: .public)")
-    
+    // Preferred location is the App Group container, because that is where the app's
+    // log viewer reads from. When a third-party re-sign voids that entitlement the
+    // container is unreachable -- the original code returned here, which silently
+    // disabled Rust logging entirely and cost us the one source that knows whether
+    // easytier reached a relay. Fall back to the extension's own sandbox instead: the
+    // app cannot read it directly, but the diagnostics command ships it back.
+    let containerURL = FileManager.default
+        .containerURL(forSecurityApplicationGroupIdentifier: APP_GROUP_ID)
+    let usedFallback = containerURL == nil
+    let baseURL = containerURL ?? FileManager.default.temporaryDirectory
+    let path = baseURL.appendingPathComponent(LOG_FILENAME).path
+    rustLogPath = path
+    dlog("initRustLogger() level=\(level.rawValue) path=\(path) appGroupAvailable=\(!usedFallback)")
+
     var errPtr: UnsafePointer<CChar>? = nil
     let ret = path.withCString { pathPtr in
         level.rawValue.withCString { levelPtr in
@@ -131,7 +141,7 @@ func initRustLogger(level: LogLevel) {
     }
     if ret != 0 {
         let err = extractRustString(errPtr)
-        logger.error("initRustLogger() failed to init: \(err ?? "Unknown", privacy: .public)")
+        dlog("initRustLogger() FAILED: \(err ?? "Unknown")")
     }
 }
 
