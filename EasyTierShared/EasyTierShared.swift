@@ -2,9 +2,41 @@
 import os
 
 public let APP_BUNDLE_ID: String = "cn.easytier"
-public let APP_GROUP_ID: String = "group.cn.easytier"
 public let ICLOUD_CONTAINER_ID: String = "iCloud.cn.easytier"
 public let LOG_FILENAME: String = "easytier.log"
+
+private let DEFAULT_APP_GROUP_ID: String = "group.cn.easytier"
+
+/// An App Group identifier is globally unique to the team that registered it, so re-signing
+/// an IPA with a third-party certificate cannot keep `group.cn.easytier`: the entitlement is
+/// renamed to whatever that certificate's profile grants rather than dropped. Lookups of the
+/// hardcoded name then return nil -- no log file, no shared defaults, no widget -- while the
+/// tunnel keeps running, because `packet-tunnel-provider` is a value any team can be granted.
+/// So fall back to the group our own embedded profile grants. App Store builds carry no
+/// profile and keep the default.
+public let APP_GROUP_ID: String = {
+    let hasContainer = { (group: String) in
+        FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: group) != nil
+    }
+    if hasContainer(DEFAULT_APP_GROUP_ID) { return DEFAULT_APP_GROUP_ID }
+
+    // A provisioning profile is a CMS envelope around a plain-text plist, and the system
+    // verified that signature at install time, so lifting the payload out is enough here.
+    guard let profile = try? Data(contentsOf: Bundle.main.bundleURL
+            .appendingPathComponent("embedded.mobileprovision")),
+          let start = profile.range(of: Data("<?xml".utf8)),
+          let end = profile.range(of: Data("</plist>".utf8), options: .backwards),
+          let plist = (try? PropertyListSerialization.propertyList(
+              from: Data(profile[start.lowerBound..<end.upperBound]),
+              options: [],
+              format: nil
+          )) as? [String: Any],
+          let entitlements = plist["Entitlements"] as? [String: Any],
+          let groups = entitlements["com.apple.security.application-groups"] as? [String]
+    else { return DEFAULT_APP_GROUP_ID }
+
+    return groups.first(where: hasContainer) ?? DEFAULT_APP_GROUP_ID
+}()
 
 public enum LogLevel: String, Codable, CaseIterable {
     case trace = "trace"
