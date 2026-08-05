@@ -29,7 +29,6 @@ struct SettingsView<Manager: NetworkExtensionManagerProtocol>: View {
 #endif
     @State private var settingsErrorMessage: TextItem?
     @State private var isExporting = false
-    @State private var isExportingDiagnostics = false
     @State private var isAlwaysOnUpdating = false
     @State private var isProfileStorageUpdating = false
     @State private var pendingProfileStorageTransition: PendingProfileStorageTransition?
@@ -216,30 +215,6 @@ struct SettingsView<Manager: NetworkExtensionManagerProtocol>: View {
                 .tint(.accentColor)
 #endif
                 .disabled(isExporting || manager.status == .disconnected)
-                // Separate from export_oslog on purpose: that one hands back a path
-                // inside the App Group container, which a re-signed build cannot reach
-                // from either side. This one carries the text back over the provider
-                // message channel, so it works even when the container does not.
-                Button(action: {
-                    exportDiagnostics()
-                }) {
-                    HStack {
-                        Text(verbatim: "Export diagnostics")
-                        Spacer()
-                        if isExportingDiagnostics {
-#if os(iOS)
-                            ProgressView()
-#endif
-                        }
-                    }
-                }
-#if os(macOS)
-                .buttonStyle(.borderless)
-                .tint(.accentColor)
-#endif
-                // Guards its own in-flight flag, not export_oslog's -- they are separate
-                // requests and one must not lock the other out.
-                .disabled(isExportingDiagnostics || manager.status == .disconnected)
             } header: {
                 Text("logging")
             } footer: {
@@ -388,58 +363,6 @@ struct SettingsView<Manager: NetworkExtensionManagerProtocol>: View {
             }
         }
         .navigationTitle("about.license")
-    }
-
-    private func exportDiagnostics() {
-        guard !isExportingDiagnostics else { return }
-        isExportingDiagnostics = true
-        Task {
-            do {
-                let url = try await manager.fetchDiagnostics()
-                await MainActor.run {
-#if os(iOS)
-                    exportURL = url
-                    isExportPresented = true
-#elseif os(macOS)
-                    do {
-                        try saveExportedFileToDisk(url)
-                    } catch {
-                        settingsErrorMessage = .init(error.localizedDescription)
-                    }
-#endif
-                }
-            } catch {
-                await MainActor.run {
-                    // Surface the raw error rather than a generic string: the failure
-                    // reason is the point of this button.
-                    settingsErrorMessage = .init(String(describing: error))
-#if os(iOS)
-                    // And hand back a file saying so, through the same share sheet the
-                    // success path uses. This view stacks three .alert modifiers, and
-                    // which of them actually presents is not something to bet a
-                    // diagnostic on -- a button that produces nothing visible is
-                    // indistinguishable from one that is simply broken.
-                    let fallback = FileManager.default.temporaryDirectory
-                        .appendingPathComponent("easytier-diagnostics-error.txt")
-                    let body = """
-                        Export diagnostics failed.
-
-                        \(String(describing: error))
-
-                        status: \(manager.status.rawValue)
-                        """
-                    if let data = body.data(using: .utf8),
-                       (try? data.write(to: fallback, options: .atomic)) != nil {
-                        exportURL = fallback
-                        isExportPresented = true
-                    }
-#endif
-                }
-            }
-            await MainActor.run {
-                isExportingDiagnostics = false
-            }
-        }
     }
 
     private func exportOSLog() {

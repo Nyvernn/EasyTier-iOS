@@ -18,17 +18,17 @@ private let DEFAULT_APP_GROUP_ID: String = "group.cn.easytier"
 /// tunnel keeps running, because `packet-tunnel-provider` is a value any team can be granted.
 /// So fall back to the group our own embedded profile grants. App Store builds carry no
 /// profile and keep the default.
-private let resolvedAppGroup: (id: String, source: String) = {
+private let resolvedAppGroup: (id: String, source: String, available: Bool) = {
     let hasContainer = { (group: String) in
         FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: group) != nil
     }
-    if hasContainer(DEFAULT_APP_GROUP_ID) { return (DEFAULT_APP_GROUP_ID, "default") }
+    if hasContainer(DEFAULT_APP_GROUP_ID) { return (DEFAULT_APP_GROUP_ID, "default", true) }
 
     // A provisioning profile is a CMS envelope around a plain-text plist, and the system
     // verified that signature at install time, so lifting the payload out is enough here.
     guard let profile = try? Data(contentsOf: Bundle.main.bundleURL
             .appendingPathComponent("embedded.mobileprovision")) else {
-        return (DEFAULT_APP_GROUP_ID, "no-profile")
+        return (DEFAULT_APP_GROUP_ID, "no-profile", false)
     }
     guard let start = profile.range(of: Data("<?xml".utf8)),
           let end = profile.range(of: Data("</plist>".utf8), options: .backwards),
@@ -39,15 +39,15 @@ private let resolvedAppGroup: (id: String, source: String) = {
           )) as? [String: Any],
           let entitlements = plist["Entitlements"] as? [String: Any],
           let groups = entitlements["com.apple.security.application-groups"] as? [String]
-    else { return (DEFAULT_APP_GROUP_ID, "unreadable-profile") }
+    else { return (DEFAULT_APP_GROUP_ID, "unreadable-profile", false) }
 
     guard let usable = groups.first(where: hasContainer) else {
         // The profile granted groups, yet none of their containers exist. Worth telling
         // apart from the cases above: it means the re-sign left the entitlement and the
         // container out of step, which no fallback here can repair.
-        return (DEFAULT_APP_GROUP_ID, "profile-has-\(groups.count)-none-usable")
+        return (DEFAULT_APP_GROUP_ID, "profile-has-\(groups.count)-none-usable", false)
     }
-    return (usable, "profile")
+    return (usable, "profile", true)
 }()
 
 public let APP_GROUP_ID: String = resolvedAppGroup.id
@@ -56,6 +56,12 @@ public let APP_GROUP_ID: String = resolvedAppGroup.id
 /// failure is otherwise indistinguishable at runtime: a wrong group disables the log file,
 /// the shared defaults and the widget at once, and leaves the tunnel working.
 public let APP_GROUP_SOURCE: String = resolvedAppGroup.source
+
+/// Whether `APP_GROUP_ID` names a container this process can actually reach. Resolved here,
+/// once, rather than by re-running `containerURL(forSecurityApplicationGroupIdentifier:)` at
+/// each use: the answer cannot change while the process lives, and callers that need it in a
+/// SwiftUI body would otherwise put a syscall on the main thread per render.
+public let APP_GROUP_AVAILABLE: Bool = resolvedAppGroup.available
 
 public enum LogLevel: String, Codable, CaseIterable {
     case trace = "trace"

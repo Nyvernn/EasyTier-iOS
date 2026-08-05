@@ -131,10 +131,6 @@ func initRustLogger(level: LogLevel) {
     let path = baseURL.appendingPathComponent(LOG_FILENAME).path
     rustLogPath = path
     dlog("initRustLogger() level=\(level.rawValue) path=\(path) appGroup=\(APP_GROUP_ID) groupSource=\(APP_GROUP_SOURCE) available=\(!usedFallback)")
-    // Point the Swift-side buffer at the same file, so the app's log page shows both
-    // halves. Done before init_logger only because the backlog replay is more useful
-    // ahead of the Rust output than buried in the middle of it.
-    DiagnosticsLog.shared.attachFile(path: path)
 
     var errPtr: UnsafePointer<CChar>? = nil
     let ret = path.withCString { pathPtr in

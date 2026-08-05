@@ -22,93 +22,31 @@ final class DiagnosticsLog {
 
     private let lock = NSLock()
     private var lines: [String] = []
-    private let limit = 4000
+    /// Kept small deliberately. The whole buffer goes out in one provider message reply,
+    /// an oversized reply is dropped without an error -- the app's completion handler is
+    /// simply never called -- and the interesting part of a startup problem is always the
+    /// first minute, which fits several times over.
+    private let limit = 800
     private let startedAt = Date()
-    private var fileHandle: FileHandle?
-
-    /// Serialises both the formatting and the writing. DateFormatter is not thread safe
-    /// and `append` is called from every queue in this process, so sharing one instance
-    /// across them would be a latent crash rather than a slow path. A serial queue also
-    /// keeps lines in order in the file and keeps a stalled disk off the caller's thread.
-    private let ioQueue = DispatchQueue(label: "\(APP_BUNDLE_ID).tunnel.diag.io")
-    private let wallClock: DateFormatter = {
-        let f = DateFormatter()
-        f.dateFormat = "yyyy-MM-dd'T'HH:mm:ss.SSS"
-        f.timeZone = TimeZone(secondsFromGMT: 0)
-        return f
-    }()
-
-    /// Mirror every line into the Rust log file as well.
-    ///
-    /// The app's log page tails exactly one file -- LOG_FILENAME in the App Group
-    /// container -- and that file belongs to the Rust tracing appender. Swift-side
-    /// instrumentation was therefore invisible there however the App Group resolved,
-    /// which is why fixing the entitlement alone would not have surfaced any of it.
-    /// Writing to the same file puts both halves of the story in one place, and in a
-    /// place readable without exporting anything.
-    ///
-    /// O_APPEND is what makes sharing the file with the Rust appender safe: every
-    /// write lands at the current end, so if that side truncates or rotates, the next
-    /// line resumes at the new end rather than leaving a hole of NUL bytes behind.
-    func attachFile(path: String) {
-        let fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0o644)
-        guard fd >= 0 else {
-            append("DiagnosticsLog.attachFile() open failed errno=\(errno) path=\(path)")
-            return
-        }
-        let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
-        lock.lock()
-        self.fileHandle = handle
-        // Everything logged before the path was known -- option parsing, the App Group
-        // resolution, the first failures -- is exactly the part worth keeping, so flush
-        // the buffer instead of starting the file at whatever comes next.
-        let backlog = lines
-        lock.unlock()
-        write(backlog.map { "\($0) (replayed)" }, to: handle)
-        append("DiagnosticsLog.attachFile() mirroring \(backlog.count) buffered lines to \(path)")
-    }
-
-    /// Tagged SWIFT so a reader can separate these from the Rust appender's own lines
-    /// in a file both sides write to, and timestamped in wall clock so the two
-    /// interleave in a meaningful order.
-    ///
-    /// The handle is passed in rather than read here because the caller already holds
-    /// it from under the lock, and this body runs later on `ioQueue`.
-    private func write(_ entries: [String], to handle: FileHandle) {
-        guard !entries.isEmpty else { return }
-        ioQueue.async { [wallClock] in
-            let stamp = wallClock.string(from: Date())
-            let text = entries.map { "\(stamp)Z SWIFT \($0)" }.joined(separator: "\n") + "\n"
-            guard let data = text.data(using: .utf8) else { return }
-            try? handle.write(contentsOf: data)
-        }
-    }
 
     func append(_ message: String) {
         let elapsed = String(format: "%8.2f", Date().timeIntervalSince(startedAt))
-        let line = "[\(elapsed)] \(message)"
         lock.lock()
-        lines.append(line)
+        lines.append("[\(elapsed)] \(message)")
         if lines.count > limit {
             lines.removeFirst(lines.count - limit)
         }
-        let handle = fileHandle
         lock.unlock()
-        // Only touch the file once a handle exists; the write itself is left outside
-        // the lock so a stalled disk cannot block every other logger in the process.
-        if let handle {
-            write([line], to: handle)
-        }
     }
 
+    /// The build and the resolved App Group lead every dump rather than appearing as one
+    /// timed line among hundreds: a wrong group silently disables the log file, the shared
+    /// defaults and the widget all at once while leaving the tunnel up, so it has to be
+    /// visible no matter how early the run went wrong.
     func dump() -> String {
         lock.lock()
         let snapshot = lines
         lock.unlock()
-        // The resolved App Group belongs in the header rather than in a timed line: a
-        // wrong group silently disables the log file, the shared defaults and the error
-        // hand-back all at once while leaving the tunnel up, so it has to be visible in
-        // every dump no matter how early the run went wrong.
         return "diag build: \(DIAG_BUILD)\n"
             + "app group: \(APP_GROUP_ID) (\(APP_GROUP_SOURCE))\n"
             + snapshot.joined(separator: "\n")
@@ -118,7 +56,7 @@ final class DiagnosticsLog {
 /// Bumped by hand on every diagnostics change, so an exported log always states
 /// which build produced it. Comparing bundle versions is not enough: the CI hands
 /// out the same version string for every commit.
-let DIAG_BUILD = "diag-3 (app group + log mirror + upload)"
+let DIAG_BUILD = "diag-4 (app group resolution + in-app log pull; probes opt-in)"
 
 /// Log to OSLog and to the retrievable buffer at once.
 ///
@@ -272,16 +210,20 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     // tun->socks5 stack later, and it is also what pins down the buffer sizes and
     // connection caps that such a stack has to be compiled with.
     //
-    // The target needs to be a TCP service on the far side that keeps echoing, and
-    // defaults to the host address exposed through EasyTier's subnet proxy. Override
-    // it by writing StressTarget ("host:port") into the App Group defaults. The run
-    // stops by itself after the last stage -- roughly three minutes total -- and
-    // sampling then continues at the idle interval.
+    // Opt-in, and deliberately so. The kernel scopes every socket this process opens to
+    // the physical interface rather than to the tunnel this same process provides, so an
+    // overlay-only target cannot be reached from here at all: the run would be 192 sockets
+    // failing to connect, which measures nothing and spends three minutes of footprint
+    // budget doing it. Set StressTarget ("host:port") in the App Group defaults to a
+    // service reachable on the *physical* network -- the concurrency-to-memory curve is
+    // about buffer counts, so it does not care which interface carries the bytes.
+    //
+    // The run stops by itself after the last stage, and sampling then continues at the
+    // idle interval.
     private static let stressStages: [Int] = [8, 32, 96, 192]
     private static let stressStageSeconds: TimeInterval = 40
     private static let stressStartDelaySeconds: TimeInterval = 45
     private static let stressPayload = Data(count: 4096)
-    private static let stressDefaultTarget = "192.168.65.254:8899"
 
     private var stressConnections: [NWConnection] = []
     private var stressActive = false
@@ -294,8 +236,9 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     // conn.start(queue:) call), which is also where the counters are mutated, so no
     // further synchronisation is needed.
     private func parseStressTarget() -> (host: String, port: UInt16)? {
-        let raw = UserDefaults(suiteName: APP_GROUP_ID)?.string(forKey: "StressTarget")
-            ?? PacketTunnelProvider.stressDefaultTarget
+        guard let raw = UserDefaults(suiteName: APP_GROUP_ID)?.string(forKey: "StressTarget") else {
+            return nil
+        }
         guard let separator = raw.lastIndex(of: ":") else { return nil }
         let host = String(raw[raw.startIndex..<separator])
         guard !host.isEmpty, let port = UInt16(raw[raw.index(after: separator)...]) else {
@@ -310,7 +253,8 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         ) { [weak self] in
             guard let self, self.activeTunnelGeneration != nil, !self.stressActive else { return }
             guard let target = self.parseStressTarget() else {
-                dlog("stress skipped: StressTarget is not a valid host:port")
+                dlog("stress skipped: no valid StressTarget host:port in App Group defaults"
+                    + " (appGroup=\(APP_GROUP_ID) source=\(APP_GROUP_SOURCE))")
                 return
             }
             self.stressActive = true
@@ -425,27 +369,28 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         logger.warning("stress finished, returning to idle sampling")
     }
 
-    // MARK: - Reachability preflight
+    // MARK: - Reachability preflight (NOT STARTED -- see startTunnel)
     //
-    // Both the telemetry sink and the load target sit behind the peer's proxied subnet,
-    // so when neither answers there is no way to tell which layer broke. These three
-    // targets separate them, and the pattern of which ones connect is the diagnosis:
+    // The reason it is not started is the one fact worth keeping from this whole exercise:
+    // the kernel automatically scopes sockets opened by a Network Extension process to the
+    // physical interface, excluding them from the tunnel that same process provides. It is
+    // a whole-process policy, so it applies no matter which API opens the socket. Three of
+    // the four targets below are therefore unreachable from here, and their failure would
+    // say nothing about whether the overlay route works -- a misreading that already cost
+    // one round of diagnosis. Pinning a socket to the tunnel needs the provider's
+    // `virtualInterface` (iOS 18+); this comes back when the probes do that, ideally
+    // probing each target twice, pinned and unpinned, so the two causes separate.
     //
-    //   overlay   the peer's virtual IP, port 11010 -- EasyTier's own listener, always
-    //             up, needs no setup on the far side. Answers only if outbound traffic
-    //             actually leaves through the tun device and reaches the peer.
-    //   proxied   the address behind the peer's --proxy-networks. Answers only if that
-    //             CIDR reached includedRoutes *and* the peer forwards it. Verified
-    //             working from another overlay node, so a failure here is iOS-side.
-    //   logsink   the same proxied address, but the port the diagnostics upload posts
-    //             to. Separate from `proxied` on purpose: if this one alone fails the
-    //             fault is a firewall rule or a dead listener, not the route.
-    //   internet  outside the tunnel entirely. Answers regardless, so if even this one
-    //             fails the probe itself is at fault and the others prove nothing.
+    //   overlay   the peer's virtual IP, port 11010 -- EasyTier's own listener. Only
+    //             reachable through the tun device, so expected to fail here.
+    //   proxied   the address behind the peer's --proxy-networks, likewise.
+    //   logsink   the same proxied address, at the port the diagnostics upload posts to.
+    //   internet  outside the tunnel entirely, so this one is expected to succeed. If it
+    //             does not, the probe itself is broken and the rest prove nothing.
     //
-    // Repeated a few times because proxy CIDRs arrive by route propagation: the first
-    // round can legitimately fail while a later one succeeds, and that difference is
-    // itself the answer.
+    // Repeated a few times because the physical path itself changes (WiFi association,
+    // captive portals), and the interface name logged with each result is what tells the
+    // three failures above apart from a probe that never had a network to begin with.
     private static let preflightTargets: [(label: String, host: String, port: UInt16)] = [
         ("overlay", "10.144.144.1", 11010),
         ("proxied", "192.168.65.254", 8899),
@@ -490,7 +435,13 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             let finish: (String) -> Void = { outcome in
                 guard !settled else { return }
                 settled = true
-                dlog("\(name) -> \(outcome)")
+                // The interface is the point: it shows which path the socket was actually
+                // placed on, so a failure caused by being scoped away from the tunnel is
+                // distinguishable from one caused by the destination being down.
+                let iface = conn.currentPath?.availableInterfaces
+                    .map { $0.name }
+                    .joined(separator: ",") ?? "none"
+                dlog("\(name) -> \(outcome) iface=\(iface)")
                 conn.cancel()
                 queue.async { conn.stateUpdateHandler = nil }
             }
@@ -517,19 +468,17 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         }
     }
 
-    // MARK: - Diagnostics upload
+    // MARK: - Diagnostics upload (NOT STARTED -- see startTunnel)
     //
-    // POST the whole buffer to a listener on the peer, over the same overlay path the
-    // rest of this build is measuring. That circularity is deliberate: an upload that
-    // arrives is itself proof the path works, and one that never arrives is answered
-    // by the preflight lines describing why.
+    // POST the whole buffer to a listener on the peer, which cannot work as written for
+    // the reason given above: URLSession from inside an .appex is scoped to the physical
+    // interface like every other socket here, and the sink sits behind the peer's proxied
+    // subnet. URLSession is also the one API with no way to be pinned to the tunnel -- the
+    // documented answer is to have the container app issue the request instead.
     //
-    // It exists because every other channel can fail without saying so. The provider
-    // message channel caps response size and hands back nothing on overflow; the share
-    // sheet needs the host app in the foreground; and three .alert modifiers on one
-    // SwiftUI view mean an error alert may simply never present. Uploading on a timer
-    // also survives a jetsam kill, which is the failure mode most worth catching here:
-    // each upload is a checkpoint, so the last one before death still reaches us.
+    // Kept because a timed upload is the only channel that survives a jetsam kill, which
+    // is the failure this build most needs to catch. It returns either aimed at a host on
+    // the physical network, or moved into the container app.
     private static let uploadHost = "192.168.65.254"
     private static let uploadPort = 8898
     private static let uploadFirstDelaySeconds: TimeInterval = 70
@@ -655,16 +604,17 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         return decoded
     }
 
-    // MARK: - Telemetry over the tunnel
+    // MARK: - Telemetry
     //
-    // With the App Group gone, both log sinks land in a container nobody can read, so
-    // the measurements are shipped straight to the peer instead. This also doubles as
-    // a liveness check on the tunnel itself: telemetry arriving at all proves the
-    // overlay carries traffic.
+    // Ships each measurement to a sink as it is taken, so the numbers survive a jetsam
+    // kill that takes the buffer with it. UDP on purpose -- stateless, so losing a sample
+    // costs nothing and there is no reconnect logic to maintain in a memory-constrained
+    // process.
     //
-    // UDP on purpose -- it is stateless, so losing a sample or two costs nothing and
-    // there is no reconnect logic to maintain inside a memory-constrained process.
-    private static let telemetryTarget = "192.168.65.254:8897"
+    // Off unless TelemetryTarget ("host:port") is set in the App Group defaults, and the
+    // host has to be on the *physical* network: sockets this process opens are scoped
+    // away from the tunnel it provides, so an overlay address would just open a doomed
+    // connection per sample and log the same failure forever.
     private var telemetryConnection: NWConnection?
     private var telemetryErrorCount = 0
 
@@ -678,10 +628,10 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     }
 
     private func sendTelemetry(_ line: String) {
+        guard let raw = UserDefaults(suiteName: APP_GROUP_ID)?.string(forKey: "TelemetryTarget"),
+              let target = PacketTunnelProvider.parseHostPort(raw),
+              let port = NWEndpoint.Port(rawValue: target.port) else { return }
         if telemetryConnection == nil {
-            guard let target = PacketTunnelProvider.parseHostPort(
-                PacketTunnelProvider.telemetryTarget
-            ), let port = NWEndpoint.Port(rawValue: target.port) else { return }
             let conn = NWConnection(
                 to: .hostPort(host: NWEndpoint.Host(target.host), port: port),
                 using: .udp
@@ -1065,8 +1015,12 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                     self.failStart(generation: generation, error: error, stopNetwork: true)
                 } else {
                     self.startMemoryProbe()
-                    self.schedulePreflight()
-                    self.startDiagnosticsUpload()
+                    // schedulePreflight() and startDiagnosticsUpload() are deliberately
+                    // not started. Neither can reach its target from here -- sockets this
+                    // process opens are scoped to the physical interface, away from the
+                    // tunnel it provides -- so both would only add a failure line a minute
+                    // to the log we are trying to read. They come back once they are
+                    // pinned to the tunnel, or aimed at the physical network.
                     self.scheduleStressTest()
                     self.completeStart(generation: generation, error: nil)
                 }
@@ -1078,11 +1032,6 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         logger.warning("stopTunnel(): triggered")
         settingsQueue.async {
             self.finishStress()
-            // Fire one last upload while the tun device is still up, then stop the timer.
-            // Best effort by nature -- stop_network_instance() runs a few lines below and
-            // will cut the request short -- but a disconnect right after a stage would
-            // otherwise lose up to a full interval of the most interesting output.
-            self.uploadDiagnostics(reason: "stop")
             self.stopDiagnosticsUpload()
             self.stopMemoryProbe()
             self.closeTelemetry()
@@ -1104,6 +1053,28 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         }
     }
     
+    /// Bounded in lines rather than bytes: slicing a String cannot split a UTF-8 sequence
+    /// the way slicing Data can, and the reply has to stay small because overflowing the
+    /// IPC channel is not reported as an error -- the app's handler is never called.
+    private static let rustLogReplyLines = 400
+
+    private func diagnosticsPayload() -> Data? {
+        var text = DiagnosticsLog.shared.dump()
+        // The Rust half too: whether easytier reached a relay and whether it learned the
+        // peer's proxy CIDRs is only known over there, and that is what the routing
+        // question hinges on.
+        if let path = rustLogPath,
+           let content = try? String(contentsOfFile: path, encoding: .utf8) {
+            let all = content.split(separator: "\n", omittingEmptySubsequences: false)
+            let tail = all.suffix(PacketTunnelProvider.rustLogReplyLines)
+            text += "\n\n===== rust log, \(tail.count) of \(all.count) lines @ \(path) =====\n"
+                + tail.joined(separator: "\n")
+        } else {
+            text += "\n\n===== rust log unreadable (path=\(rustLogPath ?? "nil")) ====="
+        }
+        return text.data(using: .utf8)
+    }
+
     override func handleAppMessage(_ messageData: Data, completionHandler: ((Data?) -> Void)?) {
         logger.debug("handleAppMessage(): triggered")
         // Add code here to handle the message.
@@ -1147,18 +1118,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                     completionHandler(nil)
                 }
             case .diagnostics:
-                var text = DiagnosticsLog.shared.dump()
-                // Append the Rust log too: whether easytier reached a relay and
-                // whether it learned the peer's proxy CIDRs is only known over there,
-                // and that is exactly what the routing question hinges on.
-                if let path = rustLogPath,
-                   let content = try? String(contentsOfFile: path, encoding: .utf8) {
-                    let tail = content.split(separator: "\n").suffix(400).joined(separator: "\n")
-                    text += "\n\n===== rust log, last 400 lines @ \(path) =====\n\(tail)"
-                } else {
-                    text += "\n\n===== rust log unavailable (path=\(rustLogPath ?? "nil")) ====="
-                }
-                completionHandler(text.data(using: .utf8))
+                completionHandler(diagnosticsPayload())
             case .lastNetworkSettings:
                 settingsQueue.async { [weak self] in
                     guard let lastAppliedSettings = self?.lastAppliedSettings else {
