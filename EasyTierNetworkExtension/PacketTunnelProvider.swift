@@ -39,9 +39,14 @@ final class DiagnosticsLog {
         lock.lock()
         let snapshot = lines
         lock.unlock()
-        return snapshot.joined(separator: "\n")
+        return "diag build: \(DIAG_BUILD)\n" + snapshot.joined(separator: "\n")
     }
 }
+
+/// Bumped by hand on every diagnostics change, so an exported log always states
+/// which build produced it. Comparing bundle versions is not enough: the CI hands
+/// out the same version string for every commit.
+let DIAG_BUILD = "diag-2 (route merge)"
 
 /// Log to OSLog and to the retrievable buffer at once.
 ///
@@ -338,6 +343,94 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         closeStressConnections()
         logMemory("stressDone")
         logger.warning("stress finished, returning to idle sampling")
+    }
+
+    // MARK: - Reachability preflight
+    //
+    // Both the telemetry sink and the load target sit behind the peer's proxied subnet,
+    // so when neither answers there is no way to tell which layer broke. These three
+    // targets separate them, and the pattern of which ones connect is the diagnosis:
+    //
+    //   overlay   the peer's virtual IP, port 11010 -- EasyTier's own listener, always
+    //             up, needs no setup on the far side. Answers only if outbound traffic
+    //             actually leaves through the tun device and reaches the peer.
+    //   proxied   the address behind the peer's --proxy-networks. Answers only if that
+    //             CIDR reached includedRoutes *and* the peer forwards it. Verified
+    //             working from another overlay node, so a failure here is iOS-side.
+    //   internet  outside the tunnel entirely. Answers regardless, so if even this one
+    //             fails the probe itself is at fault and the other two prove nothing.
+    //
+    // Repeated a few times because proxy CIDRs arrive by route propagation: the first
+    // round can legitimately fail while a later one succeeds, and that difference is
+    // itself the answer.
+    private static let preflightTargets: [(label: String, host: String, port: UInt16)] = [
+        ("overlay", "10.144.144.1", 11010),
+        ("proxied", "192.168.65.254", 8899),
+        ("internet", "1.1.1.1", 443),
+    ]
+    // Spaced to land almost entirely before the load test starts at 45s: three probe
+    // sockets are nothing next to 192, but keeping them out of the way leaves the
+    // footprint samples attributable to the stage that produced them.
+    private static let preflightRounds = 4
+    private static let preflightFirstDelaySeconds: TimeInterval = 10
+    private static let preflightIntervalSeconds: TimeInterval = 15
+    private static let preflightTimeoutSeconds: TimeInterval = 8
+
+    private func schedulePreflight() {
+        for round in 0..<PacketTunnelProvider.preflightRounds {
+            let delay = PacketTunnelProvider.preflightFirstDelaySeconds
+                + Double(round) * PacketTunnelProvider.preflightIntervalSeconds
+            settingsQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self, self.activeTunnelGeneration != nil else { return }
+                self.runPreflight(round: round)
+            }
+        }
+    }
+
+    private func runPreflight(round: Int) {
+        for target in PacketTunnelProvider.preflightTargets {
+            guard let port = NWEndpoint.Port(rawValue: target.port) else { continue }
+            let name = "preflight[\(round)] \(target.label) \(target.host):\(target.port)"
+            let conn = NWConnection(
+                to: .hostPort(host: NWEndpoint.Host(target.host), port: port),
+                using: .tcp
+            )
+            var settled = false
+            var waitingLogged = false
+            let queue = settingsQueue
+            // The handler has to be released, or it keeps the connection alive and a
+            // dozen leaked sockets end up in the very footprint being measured. Doing
+            // it on a later turn of the queue rather than inline: `finish` runs from
+            // inside that same handler, and dropping the last reference to a closure
+            // while it is executing is not something to rely on.
+            let finish: (String) -> Void = { outcome in
+                guard !settled else { return }
+                settled = true
+                dlog("\(name) -> \(outcome)")
+                conn.cancel()
+                queue.async { conn.stateUpdateHandler = nil }
+            }
+            conn.stateUpdateHandler = { state in
+                switch state {
+                case .ready:
+                    finish("ready")
+                case .failed(let error):
+                    finish("failed: \(error)")
+                case .waiting(let error):
+                    guard !waitingLogged else { return }
+                    waitingLogged = true
+                    dlog("\(name) waiting: \(error)")
+                default:
+                    break
+                }
+            }
+            conn.start(queue: settingsQueue)
+            settingsQueue.asyncAfter(
+                deadline: .now() + PacketTunnelProvider.preflightTimeoutSeconds
+            ) {
+                finish("timeout")
+            }
+        }
     }
 
     // MARK: - Configuration channels
@@ -799,6 +892,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                     self.failStart(generation: generation, error: error, stopNetwork: true)
                 } else {
                     self.startMemoryProbe()
+                    self.schedulePreflight()
                     self.scheduleStressTest()
                     self.completeStart(generation: generation, error: nil)
                 }
