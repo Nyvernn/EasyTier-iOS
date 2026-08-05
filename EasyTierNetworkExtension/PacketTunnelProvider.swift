@@ -57,7 +57,7 @@ final class DiagnosticsLog {
 /// Bumped by hand on every diagnostics change, so an exported log always states
 /// which build produced it. Comparing bundle versions is not enough: the CI hands
 /// out the same version string for every commit.
-let DIAG_BUILD = "diag-5 (pull carries the swift buffer only; single alert)"
+let DIAG_BUILD = "diag-6 (pull returns a path; every dlog line streams out as telemetry)"
 
 /// Log to OSLog and to the retrievable buffer at once.
 ///
@@ -66,6 +66,9 @@ let DIAG_BUILD = "diag-5 (pull carries the swift buffer only; single alert)"
 func dlog(_ message: String) {
     logger.warning("\(message, privacy: .public)")
     DiagnosticsLog.shared.append(message)
+    // Straight out over the tunnel as well, so nobody has to export anything by hand.
+    // Best effort and never throws: a line that cannot leave is still in the buffer above.
+    PacketTunnelProvider.emitTelemetry(message)
 }
 
 private struct ProviderMessageResponse: Codable {
@@ -166,11 +169,9 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             Double(sample.resident) / mib,
             Double(sample.footprint) / (50.0 * mib) * 100.0
         )
-        // Into the retrievable buffer as well as out over the network: telemetry can be
-        // lost to a routing problem, and the measurements are the whole point -- they
-        // must not depend solely on the channel that is itself under suspicion.
+        // dlog alone: it now both buffers the line and puts it on the wire, so calling
+        // sendTelemetry here as well would send every sample twice.
         dlog(line)
-        sendTelemetry(line)
     }
 
     private func startMemoryProbe() {
@@ -319,14 +320,9 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 Double(self.stressBytesOut) / 1048576.0,
                 Double(self.stressBytesIn) / 1048576.0
             )
+            // dlog already puts this on the wire; a second send would duplicate it.
             dlog(line)
-            self.sendTelemetry(line)
             self.logMemory("stressEnd-c\(concurrency)")
-            // Checkpoint each stage as it completes. A jetsam kill is likeliest in the
-            // stage *after* this one, and the whole point of the exercise is knowing the
-            // footprint at the concurrency that survived -- which is lost if the numbers
-            // only ever leave the device at the end of a run that never reaches its end.
-            self.uploadDiagnostics(reason: "stress-c\(concurrency)")
             self.runStressStage(index + 1, target: target)
         }
     }
@@ -364,9 +360,9 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         stressActive = false
         closeStressConnections()
         logMemory("stressDone")
-        // The complete curve in one file, sent while all 192 sockets have just been
-        // released and there is headroom to spare for the request.
-        uploadDiagnostics(reason: "stressDone")
+        // No upload here: it runs on URLSession, which cannot be pinned to the tunnel, so
+        // the request could not reach the sink. logMemory above already streamed the final
+        // sample out as telemetry, which is what the curve is made of anyway.
         logger.warning("stress finished, returning to idle sampling")
     }
 
@@ -607,15 +603,22 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
 
     // MARK: - Telemetry
     //
-    // Ships each measurement to a sink as it is taken, so the numbers survive a jetsam
-    // kill that takes the buffer with it. UDP on purpose -- stateless, so losing a sample
-    // costs nothing and there is no reconnect logic to maintain in a memory-constrained
-    // process.
+    // Every dlog line leaves the device as it is written, one UDP datagram each. The point
+    // is to stop diagnosis depending on somebody exporting a file by hand, and whether
+    // anything arrives at all is itself the first answer, because of where the sink is:
     //
-    // Off unless TelemetryTarget ("host:port") is set in the App Group defaults, and the
-    // host has to be on the *physical* network: sockets this process opens are scoped
-    // away from the tunnel it provides, so an overlay address would just open a doomed
-    // connection per sample and log the same failure forever.
+    //   The default target is the peer's *overlay* address, not the address behind its
+    //   subnet proxy. Those are different layers, and only the second one is suspect. So
+    //   datagrams arriving means the overlay data plane carries traffic and the fault is
+    //   in the proxied subnet; nothing arriving means the overlay itself is not forwarding
+    //   and the proxy layer is not even in the picture yet.
+    //
+    // UDP because it is stateless: losing a datagram costs nothing, and there is no
+    // reconnect logic to maintain in a process this memory-constrained.
+    //
+    // Overridable through TelemetryTarget ("host:port") in the App Group defaults, which
+    // is reachable again now that the group resolves at runtime.
+    private static let telemetryDefaultTarget = "10.144.144.1:8897"
     private var telemetryConnection: NWConnection?
     private var telemetryErrorCount = 0
 
@@ -628,30 +631,88 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         return (host, port)
     }
 
-    private func sendTelemetry(_ line: String) {
-        guard let raw = UserDefaults(suiteName: APP_GROUP_ID)?.string(forKey: "TelemetryTarget"),
-              let target = PacketTunnelProvider.parseHostPort(raw),
-              let port = NWEndpoint.Port(rawValue: target.port) else { return }
-        if telemetryConnection == nil {
-            let conn = NWConnection(
-                to: .hostPort(host: NWEndpoint.Host(target.host), port: port),
-                using: .udp
-            )
-            conn.stateUpdateHandler = { state in
-                // Even UDP reports state here, and "waiting" with a routing error is
-                // exactly the signature of the route never having been installed.
-                DiagnosticsLog.shared.append("telemetry conn state: \(state)")
-            }
-            conn.start(queue: settingsQueue)
-            telemetryConnection = conn
-            dlog("telemetry opened to \(target.host):\(target.port)")
+    /// Scope a connection to the tunnel this provider itself supplies.
+    ///
+    /// Without this the kernel puts the socket on the physical interface -- it excludes an
+    /// extension's own sockets from that extension's tunnel, as a whole-process policy --
+    /// and an overlay address simply does not exist there. `virtualInterface` is the
+    /// documented way back in and is non-nil by the time startTunnel runs.
+    ///
+    /// Silent by design: the caller is reached from dlog, so logging here would recurse.
+    /// Whether pinning is possible at all is reported once, from startTunnel.
+    private func pinToTunnel(_ parameters: NWParameters) {
+        if #available(iOS 18.0, macOS 15.0, *) {
+            parameters.requiredInterface = virtualInterface
         }
-        guard let conn = telemetryConnection,
-              let data = (line + "\n").data(using: .utf8) else { return }
+    }
+
+    /// Bridge for `dlog`, which is a free function and has no provider to hand.
+    ///
+    /// Hops to `settingsQueue` because dlog is called from every queue in this process
+    /// while `telemetryConnection` is not synchronised; the hop also keeps the datagrams
+    /// in the order the lines were written.
+    static func emitTelemetry(_ line: String) {
+        guard let provider = current else { return }
+        provider.settingsQueue.async { provider.sendTelemetry(line) }
+    }
+
+    /// Armed from startTunnel once the tunnel has its addresses and routes, rather than
+    /// lazily on the first line.
+    ///
+    /// The timing is the whole point. Pinned to a tun device that has no route to the
+    /// target yet, a datagram is just dropped, and UDP does not buffer -- so opening this
+    /// on the first dlog would silently lose everything logged during startup, which is
+    /// precisely the part worth having: the options, the resolved App Group, the routes
+    /// themselves. Those lines are still in the buffer, so they are replayed here.
+    private func startTelemetry() {
+        guard telemetryConnection == nil else { return }
+        let raw = UserDefaults(suiteName: APP_GROUP_ID)?.string(forKey: "TelemetryTarget")
+            ?? PacketTunnelProvider.telemetryDefaultTarget
+        guard let target = PacketTunnelProvider.parseHostPort(raw),
+              let port = NWEndpoint.Port(rawValue: target.port) else {
+            dlog("telemetry disabled: \(raw) is not a valid host:port")
+            return
+        }
+        let parameters = NWParameters.udp
+        pinToTunnel(parameters)
+        let conn = NWConnection(
+            to: .hostPort(host: NWEndpoint.Host(target.host), port: port),
+            using: parameters
+        )
+        conn.stateUpdateHandler = { state in
+            // Even UDP reports state here, and "waiting" with a routing error is exactly
+            // the signature of the route never having been installed.
+            DiagnosticsLog.shared.append("telemetry conn state: \(state)")
+        }
+        conn.start(queue: settingsQueue)
+        telemetryConnection = conn
+        // Into the buffer rather than through dlog, so the replay below carries it once
+        // instead of the replay and the live path each carrying a copy.
+        DiagnosticsLog.shared.append("telemetry opened to \(target.host):\(target.port)")
+        for line in DiagnosticsLog.shared.dump().split(
+            separator: "\n", omittingEmptySubsequences: false
+        ) {
+            transmit(String(line), over: conn)
+        }
+    }
+
+    /// Never calls `dlog`, at any depth: it is called *from* dlog, so that would recurse
+    /// until the stack ran out. Its own failures go straight to the buffer instead.
+    private func sendTelemetry(_ line: String) {
+        guard let conn = telemetryConnection else { return }
+        transmit(line, over: conn)
+    }
+
+    private func transmit(_ line: String, over conn: NWConnection) {
+        // Truncated to stay inside the tunnel's MTU. A datagram larger than that is
+        // fragmented or dropped outright, and a route dump is the one line long enough to
+        // reach it -- losing its tail beats losing the line.
+        let capped = line.count > 900 ? String(line.prefix(900)) + "…[cut]" : line
+        guard let data = (capped + "\n").data(using: .utf8) else { return }
         conn.send(content: data, completion: .contentProcessed { [weak self] error in
             guard let self, let error else { return }
-            // Only the first few: the failure mode is identical every time, and one
-            // entry per 15s sample would bury everything else in the buffer.
+            // Only the first few: the failure mode is identical every time, and one entry
+            // per line would bury everything else in the buffer.
             guard self.telemetryErrorCount < 3 else { return }
             self.telemetryErrorCount += 1
             DiagnosticsLog.shared.append(
@@ -1015,13 +1076,26 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 if let error {
                     self.failStart(generation: generation, error: error, stopNetwork: true)
                 } else {
+                    // Whether telemetry can leave at all hinges on this, and it is the
+                    // first thing to check when nothing arrives at the sink. Logged once
+                    // here rather than per connection, because the pinning helper is
+                    // reached from dlog and cannot log without recursing.
+                    if #available(iOS 18.0, macOS 15.0, *) {
+                        dlog("tunnel pinning via virtualInterface="
+                            + (self.virtualInterface?.name ?? "NIL -- nothing can be pinned"))
+                    } else {
+                        dlog("tunnel pinning UNAVAILABLE: virtualInterface needs iOS 18, so"
+                            + " telemetry goes out the physical interface and cannot reach"
+                            + " an overlay address")
+                    }
+                    self.startTelemetry()
                     self.startMemoryProbe()
-                    // schedulePreflight() and startDiagnosticsUpload() are deliberately
-                    // not started. Neither can reach its target from here -- sockets this
-                    // process opens are scoped to the physical interface, away from the
-                    // tunnel it provides -- so both would only add a failure line a minute
-                    // to the log we are trying to read. They come back once they are
-                    // pinned to the tunnel, or aimed at the physical network.
+                    // startDiagnosticsUpload() stays off: it is built on URLSession, which
+                    // is the one API with no way to be pinned to the tunnel, so it cannot
+                    // reach an overlay address from here however it is configured. The
+                    // per-line telemetry above replaces it. schedulePreflight() stays off
+                    // until its probes are pinned too -- unpinned, their failures say
+                    // nothing about routing and only mislead.
                     self.scheduleStressTest()
                     self.completeStart(generation: generation, error: nil)
                 }
@@ -1054,22 +1128,34 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         }
     }
     
-    /// Carries the Swift-side buffer only, and deliberately does not read the Rust log.
+    /// Writes the buffer into the shared container and reports its path, rather than
+    /// returning the text in the reply itself.
     ///
-    /// An earlier version appended a tail of that file, which meant loading all of it into
-    /// a String first. In a process capped near 50 MiB, against a log file that grows to
-    /// megabytes within minutes, that is either far too slow for the handler's deadline or
-    /// fatal outright -- and both look identical from the app: a nil reply. The Rust log
-    /// needs no help from this channel anyway, because it lives in the shared container
-    /// that the log page already tails directly.
-    ///
-    /// The byte count leads the reply so that a size that did arrive is on record. If the
-    /// container is ever unreachable and the Rust log is genuinely needed here, it has to
-    /// be a bounded read from the end of the file, not a whole-file load.
-    private func diagnosticsPayload() -> Data? {
-        let text = DiagnosticsLog.shared.dump()
-        guard let body = text.data(using: .utf8) else { return nil }
-        return Data("swift buffer: \(body.count) bytes\n".utf8) + body
+    /// The text does not fit. Roughly 40 KB came back to the app as nil, and the channel's
+    /// limit is undocumented, so there is no size to design against -- only a ceiling to
+    /// stop relying on. Handing back a path is what exportOSLog already does, it has no
+    /// such ceiling, and the container is reachable now that the App Group resolves at
+    /// runtime. When it is not reachable, the reason says so, because that reason is
+    /// itself the diagnosis.
+    private func diagnosticsResponse() -> ProviderMessageResponse {
+        guard let container = FileManager.default
+            .containerURL(forSecurityApplicationGroupIdentifier: APP_GROUP_ID) else {
+            return .init(
+                ok: false,
+                path: nil,
+                error: "App Group container unavailable"
+                    + " (id=\(APP_GROUP_ID) source=\(APP_GROUP_SOURCE))"
+            )
+        }
+        // A separate file from LOG_FILENAME on purpose: that one belongs to the Rust
+        // tracing appender, which may rotate or truncate it underneath a second writer.
+        let url = container.appendingPathComponent("easytier-diagnostics.txt")
+        do {
+            try Data(DiagnosticsLog.shared.dump().utf8).write(to: url, options: .atomic)
+            return .init(ok: true, path: url.path, error: nil)
+        } catch {
+            return .init(ok: false, path: nil, error: "write failed: \(error)")
+        }
     }
 
     override func handleAppMessage(_ messageData: Data, completionHandler: ((Data?) -> Void)?) {
@@ -1115,7 +1201,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                     completionHandler(nil)
                 }
             case .diagnostics:
-                completionHandler(diagnosticsPayload())
+                completionHandler(try? JSONEncoder().encode(diagnosticsResponse()))
             case .lastNetworkSettings:
                 settingsQueue.async { [weak self] in
                     guard let lastAppliedSettings = self?.lastAppliedSettings else {

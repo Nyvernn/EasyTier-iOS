@@ -356,85 +356,41 @@ class NetworkExtensionManager: NetworkExtensionManagerProtocol {
         }
     }
 
-    /// Fetch diagnostics as text and write it into the app's own temporary directory.
+    /// Ask the extension to write a file into the shared container and hand back its path.
     ///
-    /// Deliberately unlike exportExtensionLogs(), which asks the extension for a *path*
-    /// inside the App Group container: on a re-signed build that container is
-    /// unreachable from both sides, so that route yields nothing at all. Here the
-    /// extension returns the content itself over the provider message channel and the
-    /// app owns the resulting file, keeping the whole path clear of the App Group.
-    func fetchDiagnostics() async throws -> URL {
+    /// Shared by the OSLog export and the diagnostics dump, which differ only in which file
+    /// the extension writes. Both go by path rather than by value because the provider
+    /// message channel drops a reply that is too large, without reporting an error and
+    /// without a documented limit to stay under.
+    private func requestExportedFile(_ command: ProviderCommand) async throws -> URL {
         guard let manager,
               let session = manager.connection as? NETunnelProviderSession,
               session.status == .connected else {
             throw NEManagerError.providerUnavailable
         }
-        guard let message = ProviderCommand.diagnostics.rawValue.data(using: .utf8) else {
-            throw NEManagerError.invalidResponse
-        }
-        // No timeout here on purpose. sendProviderMessage gives no guarantee its handler
-        // ever runs -- a wedged extension leaves this continuation suspended forever --
-        // but racing a deadline against it means one continuation with two resume paths,
-        // and resuming twice is a hard crash. The deadline lives in the caller instead,
-        // on the main actor, where it only has to flip a bit of view state.
-        let text: String = try await withCheckedThrowingContinuation { continuation in
-            do {
-                try session.sendProviderMessage(message) { data in
-                    // The two failures are worth telling apart. A nil reply means the
-                    // extension never produced one -- wedged, killed for memory, or its
-                    // payload was too large for the channel and got dropped. Bytes that
-                    // will not decode mean it answered but the reply was cut short, which
-                    // points at the size limit specifically.
-                    guard let data else {
-                        continuation.resume(throwing: NEManagerError.exportFailed(
-                            "the extension returned no diagnostics reply"
-                        ))
-                        return
-                    }
-                    guard let text = String(data: data, encoding: .utf8) else {
-                        continuation.resume(throwing: NEManagerError.exportFailed(
-                            "diagnostics reply of \(data.count) bytes is not valid UTF-8"
-                        ))
-                        return
-                    }
-                    continuation.resume(returning: text)
-                }
-            } catch {
-                continuation.resume(throwing: error)
-            }
-        }
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("easytier-diagnostics.txt")
-        guard let data = text.data(using: .utf8) else {
-            throw NEManagerError.invalidResponse
-        }
-        try data.write(to: url, options: .atomic)
-        return url
-    }
-
-    func exportExtensionLogs() async throws -> URL {
-        guard let manager,
-              let session = manager.connection as? NETunnelProviderSession,
-              session.status == .connected else {
-            throw NEManagerError.providerUnavailable
-        }
-        guard let message = ProviderCommand.exportOSLog.rawValue.data(using: .utf8) else {
+        guard let message = command.rawValue.data(using: .utf8) else {
             throw NEManagerError.invalidResponse
         }
         return try await withCheckedThrowingContinuation { continuation in
             do {
                 try session.sendProviderMessage(message) { data in
                     guard let data else {
-                        continuation.resume(throwing: NEManagerError.invalidResponse)
+                        continuation.resume(throwing: NEManagerError.exportFailed(
+                            "the extension returned no reply to \(command.rawValue)"
+                        ))
                         return
                     }
                     do {
-                        let response = try JSONDecoder().decode(ProviderMessageResponse.self, from: data)
-                        if response.ok, let path = response.path {
-                            continuation.resume(returning: URL(fileURLWithPath: path))
-                        } else {
-                            continuation.resume(throwing: NEManagerError.exportFailed(response.error ?? "export failed"))
+                        let response = try JSONDecoder().decode(
+                            ProviderMessageResponse.self, from: data
+                        )
+                        guard response.ok, let path = response.path else {
+                            continuation.resume(throwing: NEManagerError.exportFailed(
+                                response.error ?? "\(command.rawValue) failed"
+                            ))
+                            return
                         }
+                        continuation.resume(returning: URL(fileURLWithPath: path))
                     } catch {
                         continuation.resume(throwing: error)
                     }
@@ -443,6 +399,14 @@ class NetworkExtensionManager: NetworkExtensionManagerProtocol {
                 continuation.resume(throwing: error)
             }
         }
+    }
+
+    func exportExtensionLogs() async throws -> URL {
+        try await requestExportedFile(.exportOSLog)
+    }
+
+    func fetchDiagnostics() async throws -> URL {
+        try await requestExportedFile(.diagnostics)
     }
 
     func clearCoreLog() async throws {
