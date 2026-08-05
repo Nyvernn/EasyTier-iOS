@@ -22,6 +22,10 @@ protocol NetworkExtensionManagerProtocol: ObservableObject {
     @MainActor
     func connect() async throws
     func disconnect() async
+    /// Why the last status poll produced nothing, or nil if it produced something.
+    /// Published so a dashboard can say what went wrong instead of showing a
+    /// spinner forever, which is what a silently dropped reply used to look like.
+    var lastRunningInfoError: String? { get }
     func fetchRunningInfo(_ callback: @escaping ((NetworkStatus) -> Void))
     func fetchLastNetworkSettings(_ callback: @escaping ((TunnelNetworkSettingsSnapshot?) -> Void))
     func updateName(name: String, server: String) async
@@ -69,6 +73,7 @@ class NetworkExtensionManager: NetworkExtensionManagerProtocol {
     @Published var connectedDate: Date?
     @Published var isLoading = true
     @Published var isAlwaysOnEnabled = false
+    @Published var lastRunningInfoError: String?
     
     init() {
         status = .invalid
@@ -309,19 +314,40 @@ class NetworkExtensionManager: NetworkExtensionManagerProtocol {
         do {
             let message = ProviderCommand.runningInfo.rawValue.data(using: .utf8) ?? Data()
             try session.sendProviderMessage(message) { data in
-                guard let data else { return }
+                // Each path reports why it gave up. Returning quietly is what made a blank
+                // dashboard indistinguishable from a tunnel that had not come up yet.
+                guard let data else {
+                    self.reportRunningInfo(error: "the extension returned no status reply")
+                    return
+                }
                 Self.logger.debug("fetchRunningInfo() received data: \(String(data: data, encoding: .utf8) ?? data.description)")
                 let info: NetworkStatus
                 do {
                     info = try JSONDecoder().decode(NetworkStatus.self, from: data)
                 } catch {
+                    // Verbatim: a DecodingError names the key it choked on, and one
+                    // mismatched field takes the whole dashboard down with it.
                     Self.logger.error("fetchRunningInfo() json deserialize failed: \(String(describing: error))")
+                    self.reportRunningInfo(
+                        error: "status reply of \(data.count) bytes did not decode: \(error)"
+                    )
                     return
                 }
+                self.reportRunningInfo(error: nil)
                 callback(info)
             }
         } catch {
             Self.logger.error("fetchRunningInfo() failed: \(String(describing: error))")
+            reportRunningInfo(error: "could not send the status request: \(error)")
+        }
+    }
+
+    /// Onto the main queue because this drives a view, and sendProviderMessage makes no
+    /// promise about which queue calls its handler.
+    private func reportRunningInfo(error: String?) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.lastRunningInfoError != error else { return }
+            self.lastRunningInfoError = error
         }
     }
 
@@ -497,6 +523,8 @@ class MockNEManager: NetworkExtensionManagerProtocol {
     func updateName(name: String, server: String) async { }
 
     func clearCoreLog() async throws { }
+
+    var lastRunningInfoError: String?
 
     func fetchRunningInfo(_ callback: @escaping ((NetworkStatus) -> Void)) {
         callback(MockNEManager.dummyRunningInfo)

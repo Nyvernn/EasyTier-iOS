@@ -57,7 +57,7 @@ final class DiagnosticsLog {
 /// Bumped by hand on every diagnostics change, so an exported log always states
 /// which build produced it. Comparing bundle versions is not enough: the CI hands
 /// out the same version string for every commit.
-let DIAG_BUILD = "diag-6 (pull returns a path; every dlog line streams out as telemetry)"
+let DIAG_BUILD = "diag-7 (dashboard failures are visible; app messages are logged)"
 
 /// Log to OSLog and to the retrievable buffer at once.
 ///
@@ -1159,68 +1159,101 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         }
     }
 
+    /// How many times each command has been seen, so the 1 Hz runningInfo poll cannot
+    /// drown the log. Touched only on `settingsQueue`.
+    private var appMessageCounts: [String: Int] = [:]
+
+    /// Records what arrived and how big the answer was.
+    ///
+    /// Worth the noise because a blank dashboard has two indistinguishable causes: the
+    /// command never reached this process, or it did and the reply was too large for the
+    /// channel to carry. Only the reply size tells those apart, and only from this side.
+    private func logAppMessage(_ raw: String, replyBytes: Int?) {
+        settingsQueue.async { [weak self] in
+            guard let self else { return }
+            let seen = (self.appMessageCounts[raw] ?? 0) + 1
+            self.appMessageCounts[raw] = seen
+            // The first few answer the question; after that one in sixty is enough to show
+            // it is still alive without filling the buffer with a line per second.
+            guard seen <= 3 || seen % 60 == 0 else { return }
+            let size = replyBytes.map { "\($0) bytes" } ?? "NIL"
+            dlog("handleAppMessage(\(raw)) #\(seen) reply=\(size)")
+        }
+    }
+
     override func handleAppMessage(_ messageData: Data, completionHandler: ((Data?) -> Void)?) {
         logger.debug("handleAppMessage(): triggered")
-        // Add code here to handle the message.
-        guard let completionHandler else { return }
-        if let raw = String(data: messageData, encoding: .utf8),
-           let command = ProviderCommand(rawValue: raw) {
+        guard let completionHandler else {
+            logAppMessage(
+                String(data: messageData, encoding: .utf8) ?? "<non-utf8>",
+                replyBytes: nil
+            )
+            return
+        }
+        let raw = String(data: messageData, encoding: .utf8)
+        // Every answer goes through here, so there is one place that knows what was sent
+        // back -- including the paths that answer nil.
+        let reply: (Data?) -> Void = { [weak self] data in
+            self?.logAppMessage(raw ?? "<non-utf8 \(messageData.count) bytes>", replyBytes: data?.count)
+            completionHandler(data)
+        }
+        if let raw, let command = ProviderCommand(rawValue: raw) {
             switch command {
             case .clearLog:
                 var errPtr: UnsafePointer<CChar>? = nil
                 if clear_logger(&errPtr) == 0 {
                     let response = ProviderMessageResponse(ok: true, path: nil, error: nil)
                     let data = try? JSONEncoder().encode(response)
-                    completionHandler(data)
+                    reply(data)
                 } else {
                     let err = extractRustString(errPtr) ?? "Unknown"
                     logger.error("handleAppMessage() clear logger failed: \(err, privacy: .public)")
                     let response = ProviderMessageResponse(ok: false, path: nil, error: err)
                     let data = try? JSONEncoder().encode(response)
-                    completionHandler(data)
+                    reply(data)
                 }
             case .exportOSLog:
                 do {
                     let url = try OSLogExporter.exportToAppGroup(appGroupID: APP_GROUP_ID)
                     let response = ProviderMessageResponse(ok: true, path: url.path, error: nil)
                     let data = try JSONEncoder().encode(response)
-                    completionHandler(data)
+                    reply(data)
                 } catch {
                     let response = ProviderMessageResponse(ok: false, path: nil, error: error.localizedDescription)
                     let data = try? JSONEncoder().encode(response)
-                    completionHandler(data)
+                    reply(data)
                 }
             case .runningInfo:
                 var infoPtr: UnsafePointer<CChar>? = nil
                 var errPtr: UnsafePointer<CChar>? = nil
                 if get_running_info(&infoPtr, &errPtr) == 0, let info = extractRustString(infoPtr) {
-                    completionHandler(info.data(using: .utf8))
+                    reply(info.data(using: .utf8))
                 } else if let err = extractRustString(errPtr) {
                     logger.error("handleAppMessage() failed: \(err, privacy: .public)")
-                    completionHandler(nil)
+                    reply(nil)
                 } else {
-                    completionHandler(nil)
+                    reply(nil)
                 }
             case .diagnostics:
-                completionHandler(try? JSONEncoder().encode(diagnosticsResponse()))
+                reply(try? JSONEncoder().encode(diagnosticsResponse()))
             case .lastNetworkSettings:
                 settingsQueue.async { [weak self] in
                     guard let lastAppliedSettings = self?.lastAppliedSettings else {
-                        completionHandler(nil)
+                        reply(nil)
                         return
                     }
                     do {
                         let data = try JSONEncoder().encode(lastAppliedSettings)
-                        completionHandler(data)
+                        reply(data)
                     } catch {
                         logger.error("handleAppMessage() encode settings failed: \(error, privacy: .public)")
-                        completionHandler(nil)
+                        reply(nil)
                     }
                 }
             }
             return
         }
-        completionHandler(nil)
+        reply(nil)
     }
     
     override func sleep(completionHandler: @escaping () -> Void) {
