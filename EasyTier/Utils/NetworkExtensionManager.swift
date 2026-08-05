@@ -25,26 +25,90 @@ import TOMLKit
 /// it. Which also means this only works while the tunnel is up, and that is precisely when
 /// there is anything to report.
 ///
-/// Fire and forget. Nothing here is allowed to matter: no route, no tunnel, no sink, and
-/// the datagram is dropped with no consequence to the caller.
+/// Lines are held until the connection reports `.ready`, and this is the whole design.
+/// A datagram handed over before then is discarded by the stack, and the caller reports each
+/// distinct outcome exactly once -- so the one datagram that mattered would be the one lost,
+/// every time, and the sink would stay empty while looking like a delivery problem.
+///
+/// Fire and forget past that point: no route, no sink, and a datagram simply vanishes with
+/// no consequence to the caller.
 final class AppTelemetry {
     static let shared = AppTelemetry()
 
     private static let target = NWEndpoint.hostPort(host: "192.168.65.254", port: 8897)
+    /// Bounded, because the tunnel may never come up and this must not grow without limit.
+    /// The oldest go first: a stale outcome is worth less than the current one.
+    private static let backlogLimit = 200
+
     private let queue = DispatchQueue(label: "\(APP_BUNDLE_ID).app.telemetry")
     private var connection: NWConnection?
+    private var isReady = false
+    private var backlog: [String] = []
+    private var lastByKey: [String: String] = [:]
 
-    /// Tagged APP so a reader can tell these apart from the extension's own lines in a
-    /// log both processes write to.
+    /// Tagged APP so a reader can tell these apart from the extension's own lines in a log
+    /// both processes write to.
     func send(_ line: String) {
+        queue.async { [self] in enqueue(line) }
+    }
+
+    /// Sends only when `line` differs from the last one sent under `key`.
+    ///
+    /// The dedup lives here rather than in the caller because this queue is the only place
+    /// that is already serialised. A poll running once a second, whose reply handler may be
+    /// invoked on some other queue, would otherwise be racing on its own bookkeeping.
+    func sendOnce(key: String, _ line: String) {
         queue.async { [self] in
-            if connection == nil {
-                let conn = NWConnection(to: Self.target, using: .udp)
-                conn.start(queue: queue)
-                connection = conn
+            guard lastByKey[key] != line else { return }
+            lastByKey[key] = line
+            enqueue(line)
+        }
+    }
+
+    private func enqueue(_ line: String) {
+        // Checked here rather than at each call site: this is the one door every line comes
+        // through, and reading it per line keeps the switch live without a reconnect.
+        guard isTelemetryEnabled() else { return }
+        backlog.append(line)
+        if backlog.count > Self.backlogLimit {
+            backlog.removeFirst(backlog.count - Self.backlogLimit)
+        }
+        if connection == nil { openConnection() }
+        flush()
+    }
+
+    /// Everything below runs on `queue`, including the state handler, because the connection
+    /// was started on it. So none of this needs further synchronisation.
+    private func openConnection() {
+        let conn = NWConnection(to: Self.target, using: .udp)
+        conn.stateUpdateHandler = { [weak self] state in
+            guard let self else { return }
+            switch state {
+            case .ready:
+                self.isReady = true
+                self.flush()
+            case .failed, .cancelled:
+                // Cancelled and released rather than retried: the next send opens a fresh
+                // one, and by then the tunnel may exist where it did not before. Cancelling
+                // is what lets the framework let go of it.
+                self.isReady = false
+                self.connection?.cancel()
+                self.connection = nil
+            default:
+                break
             }
-            guard let data = "APP \(line)\n".data(using: .utf8) else { return }
-            connection?.send(content: data, completion: .idempotent)
+        }
+        conn.start(queue: queue)
+        connection = conn
+    }
+
+    private func flush() {
+        guard isReady, let conn = connection, !backlog.isEmpty else { return }
+        let lines = backlog
+        backlog.removeAll()
+        for line in lines {
+            guard let data = "APP \(line)\n".data(using: .utf8) else { continue }
+            conn.send(content: data, completion: .idempotent)
         }
     }
 }
@@ -106,9 +170,6 @@ class NetworkExtensionManager: NetworkExtensionManagerProtocol {
     @Published var connectedDate: Date?
     @Published var isLoading = true
     @Published var isAlwaysOnEnabled = false
-    /// Last status-poll outcome already reported, so a once-a-second poll does not
-    /// resend the same line forever.
-    private var lastReportedRunningInfo: String?
     
     init() {
         status = .invalid
@@ -245,6 +306,7 @@ class NetworkExtensionManager: NetworkExtensionManagerProtocol {
         if let routes = config.routes {
             options.routes = routes
         }
+        options.exitNodes = config.exitNodes
         if let logLevel = UserDefaults.standard.string(forKey: "logLevel"),
            let logLevel = LogLevel.init(rawValue: logLevel) {
             options.logLevel = logLevel
@@ -385,13 +447,10 @@ class NetworkExtensionManager: NetworkExtensionManagerProtocol {
         }
     }
 
-    /// Sends a status-poll outcome to the telemetry sink, but only when it changes from the
-    /// last one. This poll runs once a second and the same outcome repeats indefinitely;
-    /// the transition is the whole message.
+    /// Reports a status-poll outcome, deduped: the poll runs once a second and the same
+    /// outcome repeats indefinitely, so the transition is the whole message.
     private func report(_ outcome: String) {
-        guard lastReportedRunningInfo != outcome else { return }
-        lastReportedRunningInfo = outcome
-        AppTelemetry.shared.send("fetchRunningInfo() \(outcome)")
+        AppTelemetry.shared.sendOnce(key: "fetchRunningInfo", "fetchRunningInfo() \(outcome)")
     }
 
     func fetchLastNetworkSettings(_ callback: @escaping ((TunnelNetworkSettingsSnapshot?) -> Void)) {

@@ -22,6 +22,9 @@ struct SettingsView<Manager: NetworkExtensionManagerProtocol>: View {
     @AppStorage("excludeAPNs", store: sharedDefaults) var excludeAPNs: Bool = true
     @AppStorage("excludeDeviceCommunication", store: sharedDefaults) var excludeDeviceCommunication: Bool = true
     @AppStorage("enforceRoutes", store: sharedDefaults) var enforceRoutes: Bool = false
+    /// In the shared defaults so the extension reads the same value. Default on: it is what
+    /// lets a problem be reported without exporting anything by hand.
+    @AppStorage(TELEMETRY_ENABLED_KEY, store: sharedDefaults) var diagnosticsTelemetry: Bool = true
     @State private var selectedPane: SettingsPane?
 #if os(iOS)
     @State private var exportURL: URL?
@@ -215,6 +218,12 @@ struct SettingsView<Manager: NetworkExtensionManagerProtocol>: View {
                 .tint(.accentColor)
 #endif
                 .disabled(isExporting || manager.status == .disconnected)
+                // Takes effect on the next connect for the extension, immediately for the
+                // app. Verbatim rather than localised because this is diagnostic plumbing,
+                // not a shipped feature.
+                Toggle(isOn: $diagnosticsTelemetry) {
+                    Text(verbatim: "Diagnostics telemetry")
+                }
             } header: {
                 Text("logging")
             } footer: {

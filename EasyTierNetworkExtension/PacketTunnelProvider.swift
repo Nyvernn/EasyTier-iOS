@@ -57,7 +57,7 @@ final class DiagnosticsLog {
 /// Bumped by hand on every diagnostics change, so an exported log always states
 /// which build produced it. Comparing bundle versions is not enough: the CI hands
 /// out the same version string for every commit.
-let DIAG_BUILD = "diag-7 (app and extension both report status-poll outcomes)"
+let DIAG_BUILD = "diag-8 (ready-gated telemetry, switchable; exit node adds a default route)"
 
 /// Log to OSLog and to the retrievable buffer at once.
 ///
@@ -622,6 +622,8 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     private static let telemetryDefaultTarget = "192.168.65.254:8897"
     private var telemetryConnection: NWConnection?
     private var telemetryErrorCount = 0
+    /// Whether the startup backlog has already gone out on this connection.
+    private var telemetryReplayed = false
 
     private static func parseHostPort(_ raw: String) -> (host: String, port: UInt16)? {
         guard let separator = raw.lastIndex(of: ":") else { return nil }
@@ -667,6 +669,12 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     /// themselves. Those lines are still in the buffer, so they are replayed here.
     private func startTelemetry() {
         guard telemetryConnection == nil else { return }
+        // Nothing is opened when it is switched off, so `sendTelemetry` finds no connection
+        // and every line stops at the in-process buffer. One check, one place.
+        guard isTelemetryEnabled() else {
+            dlog("telemetry off (\(TELEMETRY_ENABLED_KEY) is false in the App Group defaults)")
+            return
+        }
         let raw = UserDefaults(suiteName: APP_GROUP_ID)?.string(forKey: "TelemetryTarget")
             ?? PacketTunnelProvider.telemetryDefaultTarget
         guard let target = PacketTunnelProvider.parseHostPort(raw),
@@ -680,16 +688,35 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             to: .hostPort(host: NWEndpoint.Host(target.host), port: port),
             using: parameters
         )
-        conn.stateUpdateHandler = { state in
+        conn.stateUpdateHandler = { [weak self] state in
             // Even UDP reports state here, and "waiting" with a routing error is exactly
             // the signature of the route never having been installed.
             DiagnosticsLog.shared.append("telemetry conn state: \(state)")
+            // The replay waits for this. Sending immediately after start() looked like it
+            // worked -- the later datagrams arrived -- but the first several were dropped
+            // while the connection was still coming up, and those are the ones that name
+            // the build and the resolved App Group. Losing exactly the lines needed to
+            // interpret the rest is the worst possible way for this to fail.
+            if case .ready = state {
+                self?.replayBufferedTelemetry()
+            }
         }
         conn.start(queue: settingsQueue)
         telemetryConnection = conn
-        // Into the buffer rather than through dlog, so the replay below carries it once
-        // instead of the replay and the live path each carrying a copy.
+        // Into the buffer rather than through dlog, so the replay carries it once instead
+        // of the replay and the live path each carrying a copy.
         DiagnosticsLog.shared.append("telemetry opened to \(target.host):\(target.port)")
+    }
+
+    /// Sends everything logged before the wire existed, once, on the first `.ready`.
+    ///
+    /// Guarded against running twice because a UDP connection can report `.ready` again
+    /// after a path change, and a second replay would duplicate the whole startup. Takes the
+    /// connection from the property rather than as an argument, so the state handler that
+    /// calls it does not have to capture the connection it is attached to.
+    private func replayBufferedTelemetry() {
+        guard !telemetryReplayed, let conn = telemetryConnection else { return }
+        telemetryReplayed = true
         for line in DiagnosticsLog.shared.dump().split(
             separator: "\n", omittingEmptySubsequences: false
         ) {
@@ -725,6 +752,9 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     private func closeTelemetry() {
         telemetryConnection?.cancel()
         telemetryConnection = nil
+        // Reset so the next tunnel session replays its own startup rather than
+        // starting mid-story.
+        telemetryReplayed = false
     }
 
     private func resetTunnelSessionState() {

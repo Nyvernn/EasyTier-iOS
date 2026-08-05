@@ -98,6 +98,18 @@ func buildIPv4Routes(info: RunningInfo?, options: EasyTierOptions) -> [NEIPv4Rou
     if options.magicDNS {
         cidrs.insert(magicDNSCIDR)
     }
+    // An exit node is inert on iOS without this. Elsewhere the core installs a default route
+    // itself; here the only way any route reaches the tun device is includedRoutes, and
+    // traffic that never enters the tun is never offered to the exit node at all. The overlap
+    // pass below then drops every other route as covered, which is what a default route
+    // means. Everything the extension itself opens is unaffected -- the kernel scopes those
+    // to the physical interface regardless -- so the peer connections survive it.
+    if let exitNodes = options.exitNodes, !exitNodes.isEmpty {
+        if let defaultRoute = normalizeCIDR("0.0.0.0/0") {
+            dlog("buildIPv4Routes() exitNodes=\(exitNodes) -> adding default route 0.0.0.0/0")
+            cidrs.insert(defaultRoute)
+        }
+    }
     if cidrs.isEmpty {
         logger.warning("buildIPv4Routes() no routes")
     }

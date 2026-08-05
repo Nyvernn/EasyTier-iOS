@@ -63,6 +63,25 @@ public let APP_GROUP_SOURCE: String = resolvedAppGroup.source
 /// SwiftUI body would otherwise put a syscall on the main thread per render.
 public let APP_GROUP_AVAILABLE: Bool = resolvedAppGroup.available
 
+/// Whether the diagnostic telemetry stream is on.
+///
+/// Lives in the shared defaults so the app and the extension agree on it and so flipping the
+/// switch takes effect on the next connect rather than needing a new build. On unless it has
+/// been explicitly switched off: it is what makes a problem reportable without anyone having
+/// to export a file by hand, and an absent key means nobody has expressed a preference yet.
+public let TELEMETRY_ENABLED_KEY: String = "diagnosticsTelemetry"
+
+/// `nonisolated` because both callers reach it from a background queue -- the extension's
+/// settings queue and the app's telemetry queue -- and this target infers MainActor for
+/// anything unannotated. Same reason `TextItem` is declared that way.
+public nonisolated func isTelemetryEnabled() -> Bool {
+    guard let defaults = UserDefaults(suiteName: APP_GROUP_ID),
+          defaults.object(forKey: TELEMETRY_ENABLED_KEY) != nil else {
+        return true
+    }
+    return defaults.bool(forKey: TELEMETRY_ENABLED_KEY)
+}
+
 public enum LogLevel: String, Codable, CaseIterable {
     case trace = "trace"
     case debug = "debug"
@@ -80,6 +99,10 @@ public struct EasyTierOptions: Codable {
     public var logLevel: LogLevel = .info
     public var magicDNS: Bool = false
     public var dns: [String] = []
+    /// Optional rather than an empty array, because a synthesised Decodable throws on a
+    /// missing non-optional key: an always-on tunnel can reconnect on an options blob
+    /// written by the previous build, and that must not stop it from starting.
+    public var exitNodes: [String]?
 
     public init() {}
 }
