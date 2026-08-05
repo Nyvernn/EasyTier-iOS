@@ -22,11 +22,12 @@ final class DiagnosticsLog {
 
     private let lock = NSLock()
     private var lines: [String] = []
-    /// Kept small deliberately. The whole buffer goes out in one provider message reply,
-    /// an oversized reply is dropped without an error -- the app's completion handler is
-    /// simply never called -- and the interesting part of a startup problem is always the
-    /// first minute, which fits several times over.
-    private let limit = 800
+    /// Kept small deliberately. The whole buffer goes out in one provider message reply and
+    /// an oversized reply comes back as nil rather than as an error, so the cap is set well
+    /// under any plausible limit -- roughly 40 KB at the length these lines run. The
+    /// interesting part of a startup problem is always the first minute, which fits several
+    /// times over.
+    private let limit = 400
     private let startedAt = Date()
 
     func append(_ message: String) {
@@ -56,7 +57,7 @@ final class DiagnosticsLog {
 /// Bumped by hand on every diagnostics change, so an exported log always states
 /// which build produced it. Comparing bundle versions is not enough: the CI hands
 /// out the same version string for every commit.
-let DIAG_BUILD = "diag-4 (app group resolution + in-app log pull; probes opt-in)"
+let DIAG_BUILD = "diag-5 (pull carries the swift buffer only; single alert)"
 
 /// Log to OSLog and to the retrievable buffer at once.
 ///
@@ -1053,26 +1054,22 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         }
     }
     
-    /// Bounded in lines rather than bytes: slicing a String cannot split a UTF-8 sequence
-    /// the way slicing Data can, and the reply has to stay small because overflowing the
-    /// IPC channel is not reported as an error -- the app's handler is never called.
-    private static let rustLogReplyLines = 400
-
+    /// Carries the Swift-side buffer only, and deliberately does not read the Rust log.
+    ///
+    /// An earlier version appended a tail of that file, which meant loading all of it into
+    /// a String first. In a process capped near 50 MiB, against a log file that grows to
+    /// megabytes within minutes, that is either far too slow for the handler's deadline or
+    /// fatal outright -- and both look identical from the app: a nil reply. The Rust log
+    /// needs no help from this channel anyway, because it lives in the shared container
+    /// that the log page already tails directly.
+    ///
+    /// The byte count leads the reply so that a size that did arrive is on record. If the
+    /// container is ever unreachable and the Rust log is genuinely needed here, it has to
+    /// be a bounded read from the end of the file, not a whole-file load.
     private func diagnosticsPayload() -> Data? {
-        var text = DiagnosticsLog.shared.dump()
-        // The Rust half too: whether easytier reached a relay and whether it learned the
-        // peer's proxy CIDRs is only known over there, and that is what the routing
-        // question hinges on.
-        if let path = rustLogPath,
-           let content = try? String(contentsOfFile: path, encoding: .utf8) {
-            let all = content.split(separator: "\n", omittingEmptySubsequences: false)
-            let tail = all.suffix(PacketTunnelProvider.rustLogReplyLines)
-            text += "\n\n===== rust log, \(tail.count) of \(all.count) lines @ \(path) =====\n"
-                + tail.joined(separator: "\n")
-        } else {
-            text += "\n\n===== rust log unreadable (path=\(rustLogPath ?? "nil")) ====="
-        }
-        return text.data(using: .utf8)
+        let text = DiagnosticsLog.shared.dump()
+        guard let body = text.data(using: .utf8) else { return nil }
+        return Data("swift buffer: \(body.count) bytes\n".utf8) + body
     }
 
     override func handleAppMessage(_ messageData: Data, completionHandler: ((Data?) -> Void)?) {

@@ -380,8 +380,21 @@ class NetworkExtensionManager: NetworkExtensionManagerProtocol {
         let text: String = try await withCheckedThrowingContinuation { continuation in
             do {
                 try session.sendProviderMessage(message) { data in
-                    guard let data, let text = String(data: data, encoding: .utf8) else {
-                        continuation.resume(throwing: NEManagerError.invalidResponse)
+                    // The two failures are worth telling apart. A nil reply means the
+                    // extension never produced one -- wedged, killed for memory, or its
+                    // payload was too large for the channel and got dropped. Bytes that
+                    // will not decode mean it answered but the reply was cut short, which
+                    // points at the size limit specifically.
+                    guard let data else {
+                        continuation.resume(throwing: NEManagerError.exportFailed(
+                            "the extension returned no diagnostics reply"
+                        ))
+                        return
+                    }
+                    guard let text = String(data: data, encoding: .utf8) else {
+                        continuation.resume(throwing: NEManagerError.exportFailed(
+                            "diagnostics reply of \(data.count) bytes is not valid UTF-8"
+                        ))
                         return
                     }
                     continuation.resume(returning: text)

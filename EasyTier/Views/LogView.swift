@@ -18,7 +18,11 @@ struct LogView<Manager: NetworkExtensionManagerProtocol>: View {
     @State private var exportURL: URL?
     @State private var isExportPresented = false
 #endif
-    @State private var exportErrorMessage: TextItem?
+    /// One alert for the whole view. Two `.alert` modifiers stacked on the same view do not
+    /// reliably both present, which is why "Log file not found." used to vanish without a
+    /// trace and the share button looked dead; the tailer's errors are forwarded into this
+    /// one rather than getting an alert of their own.
+    @State private var alertMessage: TextItem?
     /// Log text fetched straight from the extension, used when the App Group container is
     /// unreachable and the tailer therefore has nothing to read. Non-empty means the view
     /// is showing a snapshot rather than a live tail.
@@ -140,10 +144,14 @@ struct LogView<Manager: NetworkExtensionManagerProtocol>: View {
                 break
             }
         }
-        .alert(item: $tailer.errorMessage) { msg in
-            Alert(title: Text("common.error"), message: Text(msg.text))
+        .onChange(of: tailer.errorMessage) { newValue in
+            guard let newValue else { return }
+            alertMessage = newValue
+            // Cleared so the same error can be raised again later, and so this does not
+            // re-present every time the view re-renders.
+            tailer.errorMessage = nil
         }
-        .alert(item: $exportErrorMessage) { msg in
+        .alert(item: $alertMessage) { msg in
             Alert(title: Text("common.error"), message: Text(msg.text))
         }
 #if os(iOS)
@@ -228,11 +236,11 @@ struct LogView<Manager: NetworkExtensionManagerProtocol>: View {
             }
         }
         guard let url = logFileURL() else {
-            exportErrorMessage = .init("Log file not found.")
+            alertMessage = .init("Log file not found.")
             return
         }
         guard FileManager.default.fileExists(atPath: url.path) else {
-            exportErrorMessage = .init("Log file not found.")
+            alertMessage = .init("Log file not found.")
             return
         }
         presentExport(of: url)
@@ -246,7 +254,7 @@ struct LogView<Manager: NetworkExtensionManagerProtocol>: View {
         do {
             try saveExportedFileToDisk(url)
         } catch {
-            exportErrorMessage = .init(error.localizedDescription)
+            alertMessage = .init(error.localizedDescription)
         }
 #endif
     }
