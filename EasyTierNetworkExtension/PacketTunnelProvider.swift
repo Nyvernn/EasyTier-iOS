@@ -603,22 +603,23 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
 
     // MARK: - Telemetry
     //
-    // Every dlog line leaves the device as it is written, one UDP datagram each. The point
-    // is to stop diagnosis depending on somebody exporting a file by hand, and whether
-    // anything arrives at all is itself the first answer, because of where the sink is:
+    // Every dlog line leaves the device as it is written, one UDP datagram each, so that
+    // diagnosis stops depending on somebody exporting a file by hand.
     //
-    //   The default target is the peer's *overlay* address, not the address behind its
-    //   subnet proxy. Those are different layers, and only the second one is suspect. So
-    //   datagrams arriving means the overlay data plane carries traffic and the fault is
-    //   in the proxied subnet; nothing arriving means the overlay itself is not forwarding
-    //   and the proxy layer is not even in the picture yet.
+    // The target is the peer's proxied address rather than its overlay address, and not by
+    // preference: the peer runs EasyTier inside a container, so the overlay address belongs
+    // to that container's network namespace and nothing there listens, while the sink runs
+    // on the host the container reaches at this address. Which means delivery doubles as
+    // the measurement we actually want -- datagrams arriving proves the iPhone reaches the
+    // proxied subnet, and the connection sitting in `waiting(No route to host)` says the
+    // route for it was never installed.
     //
     // UDP because it is stateless: losing a datagram costs nothing, and there is no
     // reconnect logic to maintain in a process this memory-constrained.
     //
     // Overridable through TelemetryTarget ("host:port") in the App Group defaults, which
     // is reachable again now that the group resolves at runtime.
-    private static let telemetryDefaultTarget = "10.144.144.1:8897"
+    private static let telemetryDefaultTarget = "192.168.65.254:8897"
     private var telemetryConnection: NWConnection?
     private var telemetryErrorCount = 0
 
