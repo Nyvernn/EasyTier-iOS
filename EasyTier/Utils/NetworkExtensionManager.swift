@@ -1,5 +1,8 @@
 import Foundation
 import Combine
+// Explicit: NWConnection is used directly by AppTelemetry below, and this target builds
+// with MEMBER_IMPORT_VISIBILITY on, so it is not inherited through NetworkExtension.
+import Network
 import NetworkExtension
 import WidgetKit
 import os
@@ -12,6 +15,40 @@ import SystemConfiguration
 import EasyTierShared
 import TOMLKit
 
+/// Sends diagnostic lines from the *app* to the same sink the tunnel extension reports to.
+///
+/// The app needs a path of its own because the failures worth seeing happen here: the
+/// extension hands back a status document and it is this process that fails to decode it,
+/// so the extension's log cannot say what went wrong. And it can have one, unlike the
+/// extension -- an ordinary app's sockets are not scoped away from the tunnel the way a
+/// Network Extension's are, so a datagram to the peer's proxied address just goes through
+/// it. Which also means this only works while the tunnel is up, and that is precisely when
+/// there is anything to report.
+///
+/// Fire and forget. Nothing here is allowed to matter: no route, no tunnel, no sink, and
+/// the datagram is dropped with no consequence to the caller.
+final class AppTelemetry {
+    static let shared = AppTelemetry()
+
+    private static let target = NWEndpoint.hostPort(host: "192.168.65.254", port: 8897)
+    private let queue = DispatchQueue(label: "\(APP_BUNDLE_ID).app.telemetry")
+    private var connection: NWConnection?
+
+    /// Tagged APP so a reader can tell these apart from the extension's own lines in a
+    /// log both processes write to.
+    func send(_ line: String) {
+        queue.async { [self] in
+            if connection == nil {
+                let conn = NWConnection(to: Self.target, using: .udp)
+                conn.start(queue: queue)
+                connection = conn
+            }
+            guard let data = "APP \(line)\n".data(using: .utf8) else { return }
+            connection?.send(content: data, completion: .idempotent)
+        }
+    }
+}
+
 protocol NetworkExtensionManagerProtocol: ObservableObject {
     var status: NEVPNStatus { get }
     var connectedDate: Date? { get }
@@ -22,10 +59,6 @@ protocol NetworkExtensionManagerProtocol: ObservableObject {
     @MainActor
     func connect() async throws
     func disconnect() async
-    /// Why the last status poll produced nothing, or nil if it produced something.
-    /// Published so a dashboard can say what went wrong instead of showing a
-    /// spinner forever, which is what a silently dropped reply used to look like.
-    var lastRunningInfoError: String? { get }
     func fetchRunningInfo(_ callback: @escaping ((NetworkStatus) -> Void))
     func fetchLastNetworkSettings(_ callback: @escaping ((TunnelNetworkSettingsSnapshot?) -> Void))
     func updateName(name: String, server: String) async
@@ -73,7 +106,9 @@ class NetworkExtensionManager: NetworkExtensionManagerProtocol {
     @Published var connectedDate: Date?
     @Published var isLoading = true
     @Published var isAlwaysOnEnabled = false
-    @Published var lastRunningInfoError: String?
+    /// Last status-poll outcome already reported, so a once-a-second poll does not
+    /// resend the same line forever.
+    private var lastReportedRunningInfo: String?
     
     init() {
         status = .invalid
@@ -307,17 +342,25 @@ class NetworkExtensionManager: NetworkExtensionManagerProtocol {
         try? await manager.saveToPreferences()
     }
     
+    // Every exit below reports its outcome. They all used to return quietly, which is why
+    // a dashboard with nothing on it could not be told apart from a tunnel that had not
+    // come up: the screen looks the same whether the reply never arrived, arrived and did
+    // not decode, or was never asked for.
     func fetchRunningInfo(_ callback: @escaping ((NetworkStatus) -> Void)) {
-        guard let manager else { return }
+        guard let manager else {
+            report("no tunnel manager loaded")
+            return
+        }
         guard let session = manager.connection as? NETunnelProviderSession,
-              session.status != .invalid else { return }
+              session.status != .invalid else {
+            report("no provider session, or its status is invalid")
+            return
+        }
         do {
             let message = ProviderCommand.runningInfo.rawValue.data(using: .utf8) ?? Data()
             try session.sendProviderMessage(message) { data in
-                // Each path reports why it gave up. Returning quietly is what made a blank
-                // dashboard indistinguishable from a tunnel that had not come up yet.
                 guard let data else {
-                    self.reportRunningInfo(error: "the extension returned no status reply")
+                    self.report("the extension returned no status reply")
                     return
                 }
                 Self.logger.debug("fetchRunningInfo() received data: \(String(data: data, encoding: .utf8) ?? data.description)")
@@ -326,29 +369,29 @@ class NetworkExtensionManager: NetworkExtensionManagerProtocol {
                     info = try JSONDecoder().decode(NetworkStatus.self, from: data)
                 } catch {
                     // Verbatim: a DecodingError names the key it choked on, and one
-                    // mismatched field takes the whole dashboard down with it.
+                    // mismatched field takes the whole document down with it.
                     Self.logger.error("fetchRunningInfo() json deserialize failed: \(String(describing: error))")
-                    self.reportRunningInfo(
-                        error: "status reply of \(data.count) bytes did not decode: \(error)"
-                    )
+                    self.report("reply of \(data.count) bytes did not decode: \(error)")
                     return
                 }
-                self.reportRunningInfo(error: nil)
+                // Rounded, so a payload that grows by a few bytes each second does not
+                // report itself over and over.
+                self.report("decoded ok, about \(data.count / 1024) KiB")
                 callback(info)
             }
         } catch {
             Self.logger.error("fetchRunningInfo() failed: \(String(describing: error))")
-            reportRunningInfo(error: "could not send the status request: \(error)")
+            report("could not send the status request: \(error)")
         }
     }
 
-    /// Onto the main queue because this drives a view, and sendProviderMessage makes no
-    /// promise about which queue calls its handler.
-    private func reportRunningInfo(error: String?) {
-        DispatchQueue.main.async { [weak self] in
-            guard let self, self.lastRunningInfoError != error else { return }
-            self.lastRunningInfoError = error
-        }
+    /// Sends a status-poll outcome to the telemetry sink, but only when it changes from the
+    /// last one. This poll runs once a second and the same outcome repeats indefinitely;
+    /// the transition is the whole message.
+    private func report(_ outcome: String) {
+        guard lastReportedRunningInfo != outcome else { return }
+        lastReportedRunningInfo = outcome
+        AppTelemetry.shared.send("fetchRunningInfo() \(outcome)")
     }
 
     func fetchLastNetworkSettings(_ callback: @escaping ((TunnelNetworkSettingsSnapshot?) -> Void)) {
@@ -523,8 +566,6 @@ class MockNEManager: NetworkExtensionManagerProtocol {
     func updateName(name: String, server: String) async { }
 
     func clearCoreLog() async throws { }
-
-    var lastRunningInfoError: String?
 
     func fetchRunningInfo(_ callback: @escaping ((NetworkStatus) -> Void)) {
         callback(MockNEManager.dummyRunningInfo)

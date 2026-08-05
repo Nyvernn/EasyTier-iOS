@@ -108,7 +108,15 @@ struct StatusView<Manager: NetworkExtensionManagerProtocol>: View {
                 localStatus
             }
 
-            problemSection
+            if let error = status?.errorMsg {
+                Section("common.error") {
+                    HStack {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                        Text(error)
+                    }
+                    .foregroundStyle(.red)
+                }
+            }
 
             let info = Group {
                 Picker(
@@ -144,7 +152,15 @@ struct StatusView<Manager: NetworkExtensionManagerProtocol>: View {
                     localStatus
                 }
 
-                problemSection
+                if let error = status?.errorMsg {
+                    Section("common.error") {
+                        HStack {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                            Text(error)
+                        }
+                        .foregroundStyle(.red)
+                    }
+                }
                 
                 Section("peer_info") {
                     peerInfo
@@ -244,30 +260,6 @@ struct StatusView<Manager: NetworkExtensionManagerProtocol>: View {
                     RemotePeerRowView(pair: pair)
                 }
                 .buttonStyle(.plain)
-            }
-        }
-    }
-
-    /// The core's own error, or failing that the reason the status could not be fetched.
-    ///
-    /// The second half is the point: every field on this screen comes from one JSON
-    /// document, so a reply that never arrives or does not decode empties the whole screen
-    /// at once. Without it the result is a badge that says "loading" forever, which reads
-    /// as "not connected yet" however long it has been.
-    private var problem: String? {
-        status?.errorMsg ?? manager.lastRunningInfoError
-    }
-
-    @ViewBuilder
-    private var problemSection: some View {
-        if let problem {
-            Section("common.error") {
-                HStack(alignment: .top) {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                    Text(problem)
-                        .textSelection(.enabled)
-                }
-                .foregroundStyle(.red)
             }
         }
     }
@@ -579,10 +571,7 @@ struct TrafficItem: View {
                 .font(.subheadline)
             }
             HStack(alignment: .firstTextBaseline) {
-                // A dash, not a number, until two samples exist: a rate needs an
-                // interval, and formatting the NaN that stands in for "no interval
-                // yet" printed the literal text "nan" on screen.
-                Text(diff == nil ? "-" : String(format: "%4.f", unifiedValue))
+                Text(String(format: "%4.f", unifiedValue))
                     .font(.title3)
                     .fontWeight(.medium)
                 Text(unit)

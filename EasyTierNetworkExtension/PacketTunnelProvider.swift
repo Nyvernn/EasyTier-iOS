@@ -57,7 +57,7 @@ final class DiagnosticsLog {
 /// Bumped by hand on every diagnostics change, so an exported log always states
 /// which build produced it. Comparing bundle versions is not enough: the CI hands
 /// out the same version string for every commit.
-let DIAG_BUILD = "diag-7 (dashboard failures are visible; app messages are logged)"
+let DIAG_BUILD = "diag-7 (app and extension both report status-poll outcomes)"
 
 /// Log to OSLog and to the retrievable buffer at once.
 ///
