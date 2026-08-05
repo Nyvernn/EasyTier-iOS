@@ -24,29 +24,101 @@ final class DiagnosticsLog {
     private var lines: [String] = []
     private let limit = 4000
     private let startedAt = Date()
+    private var fileHandle: FileHandle?
+
+    /// Serialises both the formatting and the writing. DateFormatter is not thread safe
+    /// and `append` is called from every queue in this process, so sharing one instance
+    /// across them would be a latent crash rather than a slow path. A serial queue also
+    /// keeps lines in order in the file and keeps a stalled disk off the caller's thread.
+    private let ioQueue = DispatchQueue(label: "\(APP_BUNDLE_ID).tunnel.diag.io")
+    private let wallClock: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd'T'HH:mm:ss.SSS"
+        f.timeZone = TimeZone(secondsFromGMT: 0)
+        return f
+    }()
+
+    /// Mirror every line into the Rust log file as well.
+    ///
+    /// The app's log page tails exactly one file -- LOG_FILENAME in the App Group
+    /// container -- and that file belongs to the Rust tracing appender. Swift-side
+    /// instrumentation was therefore invisible there however the App Group resolved,
+    /// which is why fixing the entitlement alone would not have surfaced any of it.
+    /// Writing to the same file puts both halves of the story in one place, and in a
+    /// place readable without exporting anything.
+    ///
+    /// O_APPEND is what makes sharing the file with the Rust appender safe: every
+    /// write lands at the current end, so if that side truncates or rotates, the next
+    /// line resumes at the new end rather than leaving a hole of NUL bytes behind.
+    func attachFile(path: String) {
+        let fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0o644)
+        guard fd >= 0 else {
+            append("DiagnosticsLog.attachFile() open failed errno=\(errno) path=\(path)")
+            return
+        }
+        let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+        lock.lock()
+        self.fileHandle = handle
+        // Everything logged before the path was known -- option parsing, the App Group
+        // resolution, the first failures -- is exactly the part worth keeping, so flush
+        // the buffer instead of starting the file at whatever comes next.
+        let backlog = lines
+        lock.unlock()
+        write(backlog.map { "\($0) (replayed)" }, to: handle)
+        append("DiagnosticsLog.attachFile() mirroring \(backlog.count) buffered lines to \(path)")
+    }
+
+    /// Tagged SWIFT so a reader can separate these from the Rust appender's own lines
+    /// in a file both sides write to, and timestamped in wall clock so the two
+    /// interleave in a meaningful order.
+    ///
+    /// The handle is passed in rather than read here because the caller already holds
+    /// it from under the lock, and this body runs later on `ioQueue`.
+    private func write(_ entries: [String], to handle: FileHandle) {
+        guard !entries.isEmpty else { return }
+        ioQueue.async { [wallClock] in
+            let stamp = wallClock.string(from: Date())
+            let text = entries.map { "\(stamp)Z SWIFT \($0)" }.joined(separator: "\n") + "\n"
+            guard let data = text.data(using: .utf8) else { return }
+            try? handle.write(contentsOf: data)
+        }
+    }
 
     func append(_ message: String) {
         let elapsed = String(format: "%8.2f", Date().timeIntervalSince(startedAt))
+        let line = "[\(elapsed)] \(message)"
         lock.lock()
-        lines.append("[\(elapsed)] \(message)")
+        lines.append(line)
         if lines.count > limit {
             lines.removeFirst(lines.count - limit)
         }
+        let handle = fileHandle
         lock.unlock()
+        // Only touch the file once a handle exists; the write itself is left outside
+        // the lock so a stalled disk cannot block every other logger in the process.
+        if let handle {
+            write([line], to: handle)
+        }
     }
 
     func dump() -> String {
         lock.lock()
         let snapshot = lines
         lock.unlock()
-        return "diag build: \(DIAG_BUILD)\n" + snapshot.joined(separator: "\n")
+        // The resolved App Group belongs in the header rather than in a timed line: a
+        // wrong group silently disables the log file, the shared defaults and the error
+        // hand-back all at once while leaving the tunnel up, so it has to be visible in
+        // every dump no matter how early the run went wrong.
+        return "diag build: \(DIAG_BUILD)\n"
+            + "app group: \(APP_GROUP_ID) (\(APP_GROUP_SOURCE))\n"
+            + snapshot.joined(separator: "\n")
     }
 }
 
 /// Bumped by hand on every diagnostics change, so an exported log always states
 /// which build produced it. Comparing bundle versions is not enough: the CI hands
 /// out the same version string for every commit.
-let DIAG_BUILD = "diag-2 (route merge)"
+let DIAG_BUILD = "diag-3 (app group + log mirror + upload)"
 
 /// Log to OSLog and to the retrievable buffer at once.
 ///
@@ -305,6 +377,11 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             dlog(line)
             self.sendTelemetry(line)
             self.logMemory("stressEnd-c\(concurrency)")
+            // Checkpoint each stage as it completes. A jetsam kill is likeliest in the
+            // stage *after* this one, and the whole point of the exercise is knowing the
+            // footprint at the concurrency that survived -- which is lost if the numbers
+            // only ever leave the device at the end of a run that never reaches its end.
+            self.uploadDiagnostics(reason: "stress-c\(concurrency)")
             self.runStressStage(index + 1, target: target)
         }
     }
@@ -342,6 +419,9 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         stressActive = false
         closeStressConnections()
         logMemory("stressDone")
+        // The complete curve in one file, sent while all 192 sockets have just been
+        // released and there is headroom to spare for the request.
+        uploadDiagnostics(reason: "stressDone")
         logger.warning("stress finished, returning to idle sampling")
     }
 
@@ -357,8 +437,11 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     //   proxied   the address behind the peer's --proxy-networks. Answers only if that
     //             CIDR reached includedRoutes *and* the peer forwards it. Verified
     //             working from another overlay node, so a failure here is iOS-side.
+    //   logsink   the same proxied address, but the port the diagnostics upload posts
+    //             to. Separate from `proxied` on purpose: if this one alone fails the
+    //             fault is a firewall rule or a dead listener, not the route.
     //   internet  outside the tunnel entirely. Answers regardless, so if even this one
-    //             fails the probe itself is at fault and the other two prove nothing.
+    //             fails the probe itself is at fault and the others prove nothing.
     //
     // Repeated a few times because proxy CIDRs arrive by route propagation: the first
     // round can legitimately fail while a later one succeeds, and that difference is
@@ -366,6 +449,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     private static let preflightTargets: [(label: String, host: String, port: UInt16)] = [
         ("overlay", "10.144.144.1", 11010),
         ("proxied", "192.168.65.254", 8899),
+        ("logsink", "192.168.65.254", 8898),
         ("internet", "1.1.1.1", 443),
     ]
     // Spaced to land almost entirely before the load test starts at 45s: three probe
@@ -431,6 +515,95 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 finish("timeout")
             }
         }
+    }
+
+    // MARK: - Diagnostics upload
+    //
+    // POST the whole buffer to a listener on the peer, over the same overlay path the
+    // rest of this build is measuring. That circularity is deliberate: an upload that
+    // arrives is itself proof the path works, and one that never arrives is answered
+    // by the preflight lines describing why.
+    //
+    // It exists because every other channel can fail without saying so. The provider
+    // message channel caps response size and hands back nothing on overflow; the share
+    // sheet needs the host app in the foreground; and three .alert modifiers on one
+    // SwiftUI view mean an error alert may simply never present. Uploading on a timer
+    // also survives a jetsam kill, which is the failure mode most worth catching here:
+    // each upload is a checkpoint, so the last one before death still reaches us.
+    private static let uploadHost = "192.168.65.254"
+    private static let uploadPort = 8898
+    private static let uploadFirstDelaySeconds: TimeInterval = 70
+    private static let uploadIntervalSeconds: TimeInterval = 60
+    private static let uploadTimeoutSeconds: TimeInterval = 20
+    private var uploadSequence = 0
+    private var uploadTimer: DispatchSourceTimer?
+
+    /// A short label distinguishing one run's uploads from the next, since the sink
+    /// names files by arrival time and a reconnect would otherwise interleave with the
+    /// run before it. The overlay address goes in because the last diagnosis was derailed
+    /// by two nodes silently claiming the same virtual IP, and dots become dashes so the
+    /// tag stays one path segment.
+    private lazy var uploadRunTag: String = {
+        let vip = lastOptions.flatMap { $0.ipv4 }?
+            .replacingOccurrences(of: ".", with: "-")
+        let suffix = String(UInt32.random(in: 0..<0xFFFF), radix: 16)
+        return "\(vip ?? "novip")-\(suffix)"
+    }()
+
+    private func startDiagnosticsUpload() {
+        let timer = DispatchSource.makeTimerSource(queue: settingsQueue)
+        timer.schedule(
+            deadline: .now() + PacketTunnelProvider.uploadFirstDelaySeconds,
+            repeating: PacketTunnelProvider.uploadIntervalSeconds
+        )
+        timer.setEventHandler { [weak self] in
+            self?.uploadDiagnostics(reason: "timer")
+        }
+        uploadTimer = timer
+        timer.resume()
+        dlog("startDiagnosticsUpload() sink=http://\(PacketTunnelProvider.uploadHost):\(PacketTunnelProvider.uploadPort) first=\(PacketTunnelProvider.uploadFirstDelaySeconds)s every=\(PacketTunnelProvider.uploadIntervalSeconds)s tag=\(uploadRunTag)")
+    }
+
+    private func stopDiagnosticsUpload() {
+        uploadTimer?.cancel()
+        uploadTimer = nil
+    }
+
+    private func uploadDiagnostics(reason: String) {
+        uploadSequence += 1
+        let seq = uploadSequence
+        let tag = "\(uploadRunTag)-\(String(format: "%03d", seq))-\(reason)"
+        guard let url = URL(
+            string: "http://\(PacketTunnelProvider.uploadHost):\(PacketTunnelProvider.uploadPort)/\(tag)"
+        ) else { return }
+
+        // Snapshot before the request so the body cannot grow underneath it, and so the
+        // line recording this attempt lands in the *next* upload rather than in this one.
+        let body = Data(DiagnosticsLog.shared.dump().utf8)
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.httpBody = body
+        request.setValue("text/plain; charset=utf-8", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = PacketTunnelProvider.uploadTimeoutSeconds
+
+        // Ephemeral: nothing about this should touch the extension's disk or cookie
+        // storage, and a cache here would only distort the footprint being measured.
+        let config = URLSessionConfiguration.ephemeral
+        config.timeoutIntervalForRequest = PacketTunnelProvider.uploadTimeoutSeconds
+        let session = URLSession(configuration: config)
+        let started = Date()
+        let task = session.dataTask(with: request) { _, response, error in
+            let elapsed = String(format: "%.2f", Date().timeIntervalSince(started))
+            if let error {
+                dlog("upload[\(seq)] \(reason) FAILED after \(elapsed)s bytes=\(body.count): \(error)")
+            } else {
+                let code = (response as? HTTPURLResponse)?.statusCode ?? -1
+                dlog("upload[\(seq)] \(reason) ok status=\(code) bytes=\(body.count) in \(elapsed)s")
+            }
+            session.finishTasksAndInvalidate()
+        }
+        task.resume()
     }
 
     // MARK: - Configuration channels
@@ -893,6 +1066,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 } else {
                     self.startMemoryProbe()
                     self.schedulePreflight()
+                    self.startDiagnosticsUpload()
                     self.scheduleStressTest()
                     self.completeStart(generation: generation, error: nil)
                 }
@@ -904,6 +1078,12 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         logger.warning("stopTunnel(): triggered")
         settingsQueue.async {
             self.finishStress()
+            // Fire one last upload while the tun device is still up, then stop the timer.
+            // Best effort by nature -- stop_network_instance() runs a few lines below and
+            // will cut the request short -- but a disconnect right after a stage would
+            // otherwise lose up to a full interval of the most interesting output.
+            self.uploadDiagnostics(reason: "stop")
+            self.stopDiagnosticsUpload()
             self.stopMemoryProbe()
             self.closeTelemetry()
             self.tunnelGeneration &+= 1

@@ -32,6 +32,29 @@ protocol NetworkExtensionManagerProtocol: ObservableObject {
     func setAlwaysOnEnabled(_ enabled: Bool) async throws
 }
 
+/// Resumes a continuation exactly once, whichever of several racing paths gets there
+/// first. Needed because resuming a checked continuation twice is a hard crash, so a
+/// timeout cannot simply be layered onto a callback that may still fire afterwards.
+private final class SingleResume<T> {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<T, Error>?
+
+    init(_ continuation: CheckedContinuation<T, Error>) {
+        self.continuation = continuation
+    }
+
+    private func take() -> CheckedContinuation<T, Error>? {
+        lock.lock()
+        defer { lock.unlock() }
+        let c = continuation
+        continuation = nil
+        return c
+    }
+
+    func succeed(_ value: T) { take()?.resume(returning: value) }
+    func fail(_ error: Error) { take()?.resume(throwing: error) }
+}
+
 class NetworkExtensionManager: NetworkExtensionManagerProtocol {
     private static let logger = Logger(subsystem: APP_BUNDLE_ID, category: "NEManager")
 
@@ -372,17 +395,31 @@ class NetworkExtensionManager: NetworkExtensionManagerProtocol {
         guard let message = ProviderCommand.diagnostics.rawValue.data(using: .utf8) else {
             throw NEManagerError.invalidResponse
         }
+        // Bounded, because sendProviderMessage does not guarantee its handler ever runs:
+        // if the extension is wedged or the response exceeds what the channel will carry,
+        // the continuation is never resumed and the caller waits forever. That presents
+        // as a button that does nothing at all -- no file, no error -- which is the one
+        // outcome a diagnostics button must never produce.
         let text: String = try await withCheckedThrowingContinuation { continuation in
+            let once = SingleResume(continuation)
             do {
                 try session.sendProviderMessage(message) { data in
                     guard let data, let text = String(data: data, encoding: .utf8) else {
-                        continuation.resume(throwing: NEManagerError.invalidResponse)
+                        once.fail(NEManagerError.invalidResponse)
                         return
                     }
-                    continuation.resume(returning: text)
+                    once.succeed(text)
                 }
             } catch {
-                continuation.resume(throwing: error)
+                once.fail(error)
+                return
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 15) {
+                once.fail(
+                    NEManagerError.exportFailed(
+                        "the extension did not answer the diagnostics request within 15s"
+                    )
+                )
             }
         }
         let url = FileManager.default.temporaryDirectory

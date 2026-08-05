@@ -211,6 +211,11 @@ struct SettingsView<Manager: NetworkExtensionManagerProtocol>: View {
                         }
                     }
                 }
+#if os(macOS)
+                .buttonStyle(.borderless)
+                .tint(.accentColor)
+#endif
+                .disabled(isExporting || manager.status == .disconnected)
                 // Separate from export_oslog on purpose: that one hands back a path
                 // inside the App Group container, which a re-signed build cannot reach
                 // from either side. This one carries the text back over the provider
@@ -232,7 +237,9 @@ struct SettingsView<Manager: NetworkExtensionManagerProtocol>: View {
                 .buttonStyle(.borderless)
                 .tint(.accentColor)
 #endif
-                .disabled(isExporting || manager.status == .disconnected)
+                // Guards its own in-flight flag, not export_oslog's -- they are separate
+                // requests and one must not lock the other out.
+                .disabled(isExportingDiagnostics || manager.status == .disconnected)
             } header: {
                 Text("logging")
             } footer: {
@@ -406,6 +413,27 @@ struct SettingsView<Manager: NetworkExtensionManagerProtocol>: View {
                     // Surface the raw error rather than a generic string: the failure
                     // reason is the point of this button.
                     settingsErrorMessage = .init(String(describing: error))
+#if os(iOS)
+                    // And hand back a file saying so, through the same share sheet the
+                    // success path uses. This view stacks three .alert modifiers, and
+                    // which of them actually presents is not something to bet a
+                    // diagnostic on -- a button that produces nothing visible is
+                    // indistinguishable from one that is simply broken.
+                    let fallback = FileManager.default.temporaryDirectory
+                        .appendingPathComponent("easytier-diagnostics-error.txt")
+                    let body = """
+                        Export diagnostics failed.
+
+                        \(String(describing: error))
+
+                        status: \(manager.status.rawValue)
+                        """
+                    if let data = body.data(using: .utf8),
+                       (try? data.write(to: fallback, options: .atomic)) != nil {
+                        exportURL = fallback
+                        isExportPresented = true
+                    }
+#endif
                 }
             }
             await MainActor.run {

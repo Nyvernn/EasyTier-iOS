@@ -1,4 +1,8 @@
 @preconcurrency import NetworkExtension
+// Explicit, not inherited through NetworkExtension: this target builds in Swift 6 mode
+// with MEMBER_IMPORT_VISIBILITY on, and FileManager / Bundle / PropertyListSerialization
+// are used directly below.
+import Foundation
 import os
 
 public let APP_BUNDLE_ID: String = "cn.easytier"
@@ -14,17 +18,19 @@ private let DEFAULT_APP_GROUP_ID: String = "group.cn.easytier"
 /// tunnel keeps running, because `packet-tunnel-provider` is a value any team can be granted.
 /// So fall back to the group our own embedded profile grants. App Store builds carry no
 /// profile and keep the default.
-public let APP_GROUP_ID: String = {
+private let resolvedAppGroup: (id: String, source: String) = {
     let hasContainer = { (group: String) in
         FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: group) != nil
     }
-    if hasContainer(DEFAULT_APP_GROUP_ID) { return DEFAULT_APP_GROUP_ID }
+    if hasContainer(DEFAULT_APP_GROUP_ID) { return (DEFAULT_APP_GROUP_ID, "default") }
 
     // A provisioning profile is a CMS envelope around a plain-text plist, and the system
     // verified that signature at install time, so lifting the payload out is enough here.
     guard let profile = try? Data(contentsOf: Bundle.main.bundleURL
-            .appendingPathComponent("embedded.mobileprovision")),
-          let start = profile.range(of: Data("<?xml".utf8)),
+            .appendingPathComponent("embedded.mobileprovision")) else {
+        return (DEFAULT_APP_GROUP_ID, "no-profile")
+    }
+    guard let start = profile.range(of: Data("<?xml".utf8)),
           let end = profile.range(of: Data("</plist>".utf8), options: .backwards),
           let plist = (try? PropertyListSerialization.propertyList(
               from: Data(profile[start.lowerBound..<end.upperBound]),
@@ -33,10 +39,23 @@ public let APP_GROUP_ID: String = {
           )) as? [String: Any],
           let entitlements = plist["Entitlements"] as? [String: Any],
           let groups = entitlements["com.apple.security.application-groups"] as? [String]
-    else { return DEFAULT_APP_GROUP_ID }
+    else { return (DEFAULT_APP_GROUP_ID, "unreadable-profile") }
 
-    return groups.first(where: hasContainer) ?? DEFAULT_APP_GROUP_ID
+    guard let usable = groups.first(where: hasContainer) else {
+        // The profile granted groups, yet none of their containers exist. Worth telling
+        // apart from the cases above: it means the re-sign left the entitlement and the
+        // container out of step, which no fallback here can repair.
+        return (DEFAULT_APP_GROUP_ID, "profile-has-\(groups.count)-none-usable")
+    }
+    return (usable, "profile")
 }()
+
+public let APP_GROUP_ID: String = resolvedAppGroup.id
+
+/// Which of the branches above produced `APP_GROUP_ID`. Diagnostics print it because the
+/// failure is otherwise indistinguishable at runtime: a wrong group disables the log file,
+/// the shared defaults and the widget at once, and leaves the tunnel working.
+public let APP_GROUP_SOURCE: String = resolvedAppGroup.source
 
 public enum LogLevel: String, Codable, CaseIterable {
     case trace = "trace"

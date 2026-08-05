@@ -118,18 +118,23 @@ nonisolated(unsafe) var rustLogPath: String?
 
 func initRustLogger(level: LogLevel) {
     // Preferred location is the App Group container, because that is where the app's
-    // log viewer reads from. When a third-party re-sign voids that entitlement the
-    // container is unreachable -- the original code returned here, which silently
-    // disabled Rust logging entirely and cost us the one source that knows whether
-    // easytier reached a relay. Fall back to the extension's own sandbox instead: the
-    // app cannot read it directly, but the diagnostics command ships it back.
+    // log viewer reads from. APP_GROUP_ID names whichever group the signature actually
+    // grants, so a re-signed build normally still lands here -- but when that resolution
+    // comes up empty the container is unreachable, and the original code returned at this
+    // point, which silently disabled Rust logging entirely and cost us the one source
+    // that knows whether easytier reached a relay. Fall back to the extension's own
+    // sandbox instead: the app cannot read it directly, but diagnostics ships it back.
     let containerURL = FileManager.default
         .containerURL(forSecurityApplicationGroupIdentifier: APP_GROUP_ID)
     let usedFallback = containerURL == nil
     let baseURL = containerURL ?? FileManager.default.temporaryDirectory
     let path = baseURL.appendingPathComponent(LOG_FILENAME).path
     rustLogPath = path
-    dlog("initRustLogger() level=\(level.rawValue) path=\(path) appGroupAvailable=\(!usedFallback)")
+    dlog("initRustLogger() level=\(level.rawValue) path=\(path) appGroup=\(APP_GROUP_ID) groupSource=\(APP_GROUP_SOURCE) available=\(!usedFallback)")
+    // Point the Swift-side buffer at the same file, so the app's log page shows both
+    // halves. Done before init_logger only because the backlog replay is more useful
+    // ahead of the Rust output than buried in the middle of it.
+    DiagnosticsLog.shared.attachFile(path: path)
 
     var errPtr: UnsafePointer<CChar>? = nil
     let ret = path.withCString { pathPtr in
