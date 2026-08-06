@@ -90,6 +90,14 @@ func buildIPv4Routes(info: RunningInfo?, options: EasyTierOptions) -> [NEIPv4Rou
     if options.magicDNS {
         cidrs.insert(magicDNSCIDR)
     }
+    // An exit node does nothing on iOS without this. Elsewhere the core installs a default
+    // route itself; here includedRoutes is the only way a route reaches the tun device, and
+    // traffic that never enters the tun is never offered to the exit node.
+    if let exitNodes = options.exitNodes, !exitNodes.isEmpty,
+       let defaultRoute = normalizeCIDR("0.0.0.0/0") {
+        logger.info("buildIPv4Routes() exit node in use, adding a default route")
+        cidrs.insert(defaultRoute)
+    }
     if cidrs.isEmpty {
         logger.warning("buildIPv4Routes() no routes")
     }
