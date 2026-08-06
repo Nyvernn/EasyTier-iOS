@@ -628,8 +628,16 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     private static let telemetryDefaultTarget = "192.168.65.254:8897"
     private var telemetryConnection: NWConnection?
     private var telemetryErrorCount = 0
-    /// Whether the startup backlog has already gone out on this connection.
-    private var telemetryReplayed = false
+    /// How many times the startup backlog has gone out on this connection.
+    private var telemetryReplayCount = 0
+    /// When to try again after `.ready`, which on its own has never delivered one.
+    ///
+    /// Measured: nothing written in roughly the first three seconds of a session ever reaches
+    /// the sink, and everything after does -- the first proof of flow is a tail line at six
+    /// seconds. `.ready` arrives inside that window, so replaying on it puts the entire
+    /// startup block, which exists nowhere else, into the one interval that discards it. The
+    /// fix is not a better signal but a later one.
+    private static let telemetryReplayRetries: [TimeInterval] = [10, 25]
 
     private static func parseHostPort(_ raw: String) -> (host: String, port: UInt16)? {
         guard let separator = raw.lastIndex(of: ":") else { return nil }
@@ -668,19 +676,17 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     /// Armed from startTunnel once the tunnel has its addresses and routes, rather than
     /// lazily on the first line.
     ///
-    /// The timing is the whole point. Pinned to a tun device that has no route to the
-    /// target yet, a datagram is just dropped, and UDP does not buffer -- so opening this
-    /// on the first dlog would silently lose everything logged during startup, which is
-    /// precisely the part worth having: the options, the resolved App Group, the routes
-    /// themselves. Those lines are still in the buffer, so they are replayed here.
+    /// The timing is the whole point, but not in the way it first appears. Pinned to a tun
+    /// device with no route to the target yet, a datagram is simply dropped and UDP does not
+    /// buffer -- and that window turned out to last seconds, not milliseconds, and to outlast
+    /// `.ready`. So opening late is necessary and still not sufficient: what actually gets the
+    /// startup out is retrying the replay past the window, from the timers set up below.
     private func startTelemetry() {
-        // Always a new connection, never a surviving one. This process outlives a tunnel
-        // session -- iOS restarts the tunnel on a network change without calling stopTunnel --
-        // and a connection carried over is pinned to the previous utun, which no longer
-        // exists, while `telemetryReplayed` is still set. That is the state that swallowed
-        // every startup replay after the first: the wire looked open, so nothing reported a
-        // failure, and the only lines that arrived were the ones written late enough for a
-        // new utun to have taken the old one's name.
+        // A new connection per session, never a surviving one: this process outlives a tunnel
+        // session, because iOS restarts the tunnel on a network change without calling
+        // stopTunnel, and a carried-over connection is pinned to a utun that is gone. Worth
+        // doing on its own -- though it was not, as once claimed here, the reason the startup
+        // replay went missing. That was the dead window above, and only the retries fixed it.
         closeTelemetry()
         // Nothing is opened when it is switched off, so `sendTelemetry` finds no connection
         // and every line stops at the in-process buffer. One check, one place.
@@ -702,16 +708,15 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             using: parameters
         )
         conn.stateUpdateHandler = { [weak self] state in
-            // Even UDP reports state here, and "waiting" with a routing error is exactly
-            // the signature of the route never having been installed.
-            DiagnosticsLog.shared.append("telemetry conn state: \(state)")
-            // The replay waits for this. Sending immediately after start() looked like it
-            // worked -- the later datagrams arrived -- but the first several were dropped
-            // while the connection was still coming up, and those are the ones that name
-            // the build and the resolved App Group. Losing exactly the lines needed to
-            // interpret the rest is the worst possible way for this to fail.
+            guard let self else { return }
+            let line = "telemetry conn state: \(state)"
+            DiagnosticsLog.shared.append(line)
+            // Put on the wire as well, not only in the buffer. Which states this connection
+            // reaches is the first thing to know when lines go missing, and recording it only
+            // in the buffer made that fact depend on the very replay that was failing.
+            self.transmit(line, over: conn)
             if case .ready = state {
-                self?.replayBufferedTelemetry()
+                self.replayBufferedTelemetry(trigger: "ready")
             }
         }
         conn.start(queue: settingsQueue)
@@ -719,6 +724,11 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         // Into the buffer rather than through dlog, so the replay carries it once instead
         // of the replay and the live path each carrying a copy.
         DiagnosticsLog.shared.append("telemetry opened to \(target.host):\(target.port)")
+        for delay in PacketTunnelProvider.telemetryReplayRetries {
+            settingsQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
+                self?.replayBufferedTelemetry(trigger: "+\(Int(delay))s")
+            }
+        }
     }
 
     /// Sends everything logged before the wire existed, once, on the first `.ready`.
@@ -727,18 +737,20 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     /// after a path change, and a second replay would duplicate the whole startup. Takes the
     /// connection from the property rather than as an argument, so the state handler that
     /// calls it does not have to capture the connection it is attached to.
-    private func replayBufferedTelemetry() {
-        guard !telemetryReplayed, let conn = telemetryConnection else { return }
-        telemetryReplayed = true
+    private func replayBufferedTelemetry(trigger: String) {
+        guard let conn = telemetryConnection else { return }
+        telemetryReplayCount += 1
+        let pass = telemetryReplayCount
         let lines = DiagnosticsLog.shared.dump().split(
             separator: "\n", omittingEmptySubsequences: false
         )
         for line in lines {
             transmit(String(line), over: conn)
         }
-        // Last, and states its own count, so the sink can tell "the replay never ran" from
-        // "the replay ran and its datagrams were dropped" without another build to find out.
-        transmit("telemetry replayed \(lines.count) lines", over: conn)
+        // Last, and names its own pass and count, so a reader can tell which attempt got
+        // through and how much of the startup existed by then. A pass that arrives duplicating
+        // an earlier one costs a dozen datagrams; a startup nobody can see costs a build.
+        transmit("telemetry replay pass \(pass) via \(trigger): \(lines.count) lines", over: conn)
     }
 
     /// Never calls `dlog`, at any depth: it is called *from* dlog, so that would recurse
@@ -907,7 +919,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         telemetryConnection = nil
         // Reset so the next tunnel session replays its own startup rather than
         // starting mid-story.
-        telemetryReplayed = false
+        telemetryReplayCount = 0
     }
 
     private func resetTunnelSessionState() {

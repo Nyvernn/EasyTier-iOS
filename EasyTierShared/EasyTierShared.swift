@@ -70,7 +70,7 @@ public let APP_GROUP_AVAILABLE: Bool = resolvedAppGroup.available
 /// Shared rather than per-target so the app and the extension cannot disagree about which
 /// build is running -- they are installed together, and a report from one is read alongside
 /// the other's.
-public let DIAG_BUILD: String = "diag-10 (telemetry survives a reconnect, the app reports too, core noise filtered)"
+public let DIAG_BUILD: String = "diag-11 (the startup block is retried past the dead window, both sides)"
 
 /// Whether the diagnostic telemetry stream is on.
 ///

@@ -45,13 +45,19 @@ final class AppTelemetry {
     /// unreachable sink costs a fixed number of attempts instead of retrying for the session.
     private static let reopenDelay: TimeInterval = 3
     private static let reopenLimit = 10
+    /// How many times the backlog is sent, and how far apart. The extension's telemetry
+    /// measured the window from the other side: nothing sent in roughly the first three
+    /// seconds of a tunnel session arrives, and the first proof of flow is at six. So the
+    /// later rounds are the ones that matter and the first is nearly free.
+    private static let flushRounds = 4
+    private static let flushInterval: TimeInterval = 6
 
     private let queue = DispatchQueue(label: "\(APP_BUNDLE_ID).app.telemetry")
     private var connection: NWConnection?
-    private var isReady = false
     private var backlog: [String] = []
     private var lastByKey: [String: String] = [:]
     private var reopenCount = 0
+    private var flushing = false
 
     /// Tagged APP so a reader can tell these apart from the extension's own lines in a log
     /// both processes write to.
@@ -81,7 +87,9 @@ final class AppTelemetry {
             backlog.removeFirst(backlog.count - Self.backlogLimit)
         }
         if connection == nil { openConnection() }
-        flush()
+        guard !flushing else { return }
+        flushing = true
+        flush(round: 1)
     }
 
     /// Everything below runs on `queue`, including the state handler, because the connection
@@ -97,9 +105,7 @@ final class AppTelemetry {
             guard let self, let conn, self.connection === conn else { return }
             switch state {
             case .ready:
-                self.isReady = true
                 self.reopenCount = 0
-                self.flush()
             case .waiting, .failed, .cancelled:
                 // All three end the same way: let go of this one and open another shortly,
                 // by which time the tunnel may exist where it did not. `.waiting` is included
@@ -122,7 +128,6 @@ final class AppTelemetry {
     /// when the last one was opened.
     private func reopen() {
         guard let current = connection else { return }
-        isReady = false
         connection = nil
         current.cancel()
         guard !backlog.isEmpty, reopenCount < Self.reopenLimit else { return }
@@ -133,13 +138,26 @@ final class AppTelemetry {
         }
     }
 
-    private func flush() {
-        guard isReady, let conn = connection, !backlog.isEmpty else { return }
-        let lines = backlog
-        backlog.removeAll()
-        for line in lines {
+    /// Sends the whole backlog now, again on a timer a few times, then lets it go.
+    ///
+    /// Not gated on `.ready`. Measured from the extension side, readiness is announced while
+    /// the tunnel still discards datagrams, so waiting for it and sending once is a reliable
+    /// way to lose everything -- which is at least part of why no app-side line has ever
+    /// arrived. Repeating a handful of lines over UDP costs nothing, and a duplicate in the log
+    /// beats a silence that means two different things.
+    private func flush(round: Int) {
+        for line in backlog {
             guard let data = "APP \(line)\n".data(using: .utf8) else { continue }
-            conn.send(content: data, completion: .idempotent)
+            connection?.send(content: data, completion: .idempotent)
+        }
+        guard round < Self.flushRounds else {
+            backlog.removeAll()
+            flushing = false
+            return
+        }
+        queue.asyncAfter(deadline: .now() + Self.flushInterval) { [self] in
+            if connection == nil { openConnection() }
+            flush(round: round + 1)
         }
     }
 }
