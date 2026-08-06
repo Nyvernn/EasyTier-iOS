@@ -781,9 +781,15 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     /// Past this far behind, skip forward rather than stay behind forever: a permanent lag
     /// means everything arriving is stale, which is worse than a gap that says so.
     private static let rustLogTailMaxBacklog = 256 * 1024
+    /// One line per forwarded packet, and 96% of everything the tail produced in its first
+    /// run: 16552 lines out of 17312. Left in, it buries every other line in the stream and
+    /// adds steady traffic to a link whose memory leak scales with exactly that. Matched as a
+    /// substring because the message is fixed and the peer ids after it are not.
+    private static let rustLogNoise = ["foreign network client send msg success"]
     private var rustLogTailTimer: DispatchSourceTimer?
     private var rustLogTailHandle: FileHandle?
     private var rustLogTailOffset: UInt64 = 0
+    private var rustLogSuppressed = 0
 
     private func startRustLogTail() {
         // Reopened per session for the same reason the telemetry connection is: the core
@@ -816,6 +822,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         try? rustLogTailHandle?.close()
         rustLogTailHandle = nil
         rustLogTailOffset = 0
+        rustLogSuppressed = 0
     }
 
     private func pumpRustLogTail() {
@@ -851,9 +858,22 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 usable = chunk
                 rustLogTailOffset = start + UInt64(chunk.count)
             }
-            for line in String(decoding: usable, as: UTF8.self)
+            var suppressed = 0
+            for raw in String(decoding: usable, as: UTF8.self)
                 .split(separator: "\n", omittingEmptySubsequences: true) {
+                let line = String(raw)
+                if PacketTunnelProvider.rustLogNoise.contains(where: { line.range(of: $0) != nil }) {
+                    suppressed += 1
+                    continue
+                }
                 transmit("RUST " + line, over: conn)
+            }
+            // Said out loud rather than dropped quietly: a filtered stream that does not
+            // admit to filtering reads as the whole log, and the count is also the cheapest
+            // measure of how much the tunnel is actually forwarding.
+            if suppressed > 0 {
+                rustLogSuppressed += suppressed
+                transmit("RUST-FILTER suppressed \(rustLogSuppressed) noise lines so far", over: conn)
             }
         } catch {
             dlog("rust log tail read failed: \(error)")
