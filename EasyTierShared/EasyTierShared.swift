@@ -8,6 +8,13 @@ import os
 public let APP_BUNDLE_ID: String = "cn.easytier"
 public let ICLOUD_CONTAINER_ID: String = "iCloud.cn.easytier"
 public let LOG_FILENAME: String = "easytier.log"
+/// Where the extension leaves the core's running info for the app to read.
+///
+/// The dashboard used to ask for it over `sendProviderMessage` and got nil every single time,
+/// while the identical call inside the extension returns real data. The shared container is a
+/// path both processes have already proven they can use, so it does not matter which of the
+/// two possible reasons for that nil applies.
+public let RUNNING_INFO_FILENAME: String = "running-info.json"
 
 private let DEFAULT_APP_GROUP_ID: String = "group.cn.easytier"
 
@@ -70,7 +77,7 @@ public let APP_GROUP_AVAILABLE: Bool = resolvedAppGroup.available
 /// Shared rather than per-target so the app and the extension cannot disagree about which
 /// build is running -- they are installed together, and a report from one is read alongside
 /// the other's.
-public let DIAG_BUILD: String = "diag-11 (the startup block is retried past the dead window, both sides)"
+public let DIAG_BUILD: String = "diag-12 (running info goes through the shared container, not the provider channel)"
 
 /// Whether the diagnostic telemetry stream is on.
 ///

@@ -464,43 +464,44 @@ class NetworkExtensionManager: NetworkExtensionManagerProtocol {
     // a dashboard with nothing on it could not be told apart from a tunnel that had not
     // come up: the screen looks the same whether the reply never arrived, arrived and did
     // not decode, or was never asked for.
+    /// Read from the shared container, where the extension publishes it every couple of
+    /// seconds, rather than requested over `sendProviderMessage`.
+    ///
+    /// That request returned nil on every single poll, while the identical call inside the
+    /// extension returns real data -- it is what the installed routes are built from. Either
+    /// the message never arrived or the reply was past whatever size the channel carries; this
+    /// works in both cases, and in the first no request-and-answer scheme could.
     func fetchRunningInfo(_ callback: @escaping ((NetworkStatus) -> Void)) {
-        guard let manager else {
-            report("no tunnel manager loaded")
+        guard let container = FileManager.default.containerURL(
+            forSecurityApplicationGroupIdentifier: APP_GROUP_ID
+        ) else {
+            report("no App Group container for \(APP_GROUP_ID)")
             return
         }
-        guard let session = manager.connection as? NETunnelProviderSession,
-              session.status != .invalid else {
-            report("no provider session, or its status is invalid")
-            return
-        }
+        let url = container.appendingPathComponent(RUNNING_INFO_FILENAME)
+        let data: Data
         do {
-            let message = ProviderCommand.runningInfo.rawValue.data(using: .utf8) ?? Data()
-            try session.sendProviderMessage(message) { data in
-                guard let data else {
-                    self.report("the extension returned no status reply")
-                    return
-                }
-                Self.logger.debug("fetchRunningInfo() received data: \(String(data: data, encoding: .utf8) ?? data.description)")
-                let info: NetworkStatus
-                do {
-                    info = try JSONDecoder().decode(NetworkStatus.self, from: data)
-                } catch {
-                    // Verbatim: a DecodingError names the key it choked on, and one
-                    // mismatched field takes the whole document down with it.
-                    Self.logger.error("fetchRunningInfo() json deserialize failed: \(String(describing: error))")
-                    self.report("reply of \(data.count) bytes did not decode: \(error)")
-                    return
-                }
-                // Rounded, so a payload that grows by a few bytes each second does not
-                // report itself over and over.
-                self.report("decoded ok, about \(data.count / 1024) KiB")
-                callback(info)
-            }
+            data = try Data(contentsOf: url)
         } catch {
-            Self.logger.error("fetchRunningInfo() failed: \(String(describing: error))")
-            report("could not send the status request: \(error)")
+            // Expected until the tunnel has been up for a second or two, and the message says
+            // so rather than looking like a failure.
+            report("no \(RUNNING_INFO_FILENAME) yet: \(error.localizedDescription)")
+            return
         }
+        let info: NetworkStatus
+        do {
+            info = try JSONDecoder().decode(NetworkStatus.self, from: data)
+        } catch {
+            // Verbatim: a DecodingError names the key it choked on, and one mismatched field
+            // takes the whole document down with it.
+            Self.logger.error("fetchRunningInfo() json deserialize failed: \(String(describing: error))")
+            report("\(data.count) bytes did not decode: \(error)")
+            return
+        }
+        // Rounded, so a payload that grows by a few bytes each second does not report itself
+        // over and over.
+        report("decoded ok from the App Group, about \(data.count / 1024) KiB")
+        callback(info)
     }
 
     /// Reports a status-poll outcome, deduped: the poll runs once a second and the same

@@ -166,14 +166,19 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         let elapsed = memoryProbeStartedAt.map { Int(Date().timeIntervalSince($0)) } ?? 0
         // pctOf50MiB is a reading aid only; nothing branches on it, precisely because
         // the real budget is undocumented and varies by iOS version.
+        // appMsgs rides along here because this line is the one that reliably arrives. Whether
+        // a provider message ever reaches this process is the open question behind the blank
+        // dashboard, and asking it through the per-message logging made the answer depend on
+        // the same delivery that was failing. A zero here means they never arrive at all.
         let line = String(
-            format: "memProbe(%@) t=%lds footprint=%.2fMiB peak=%.2fMiB resident=%.2fMiB pctOf50MiB=%.1f%%",
+            format: "memProbe(%@) t=%lds footprint=%.2fMiB peak=%.2fMiB resident=%.2fMiB pctOf50MiB=%.1f%% appMsgs=%ld",
             tag,
             elapsed,
             Double(sample.footprint) / mib,
             Double(memoryPeakBytes) / mib,
             Double(sample.resident) / mib,
-            Double(sample.footprint) / (50.0 * mib) * 100.0
+            Double(sample.footprint) / (50.0 * mib) * 100.0,
+            appMessageCounts.values.reduce(0, +)
         )
         // dlog alone: it now both buffers the line and puts it on the wire, so calling
         // sendTelemetry here as well would send every sample twice.
@@ -989,6 +994,81 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         logger.warning("handleRunningInfoChanged(): triggered")
         enqueueSettingsUpdate()
     }
+
+    // MARK: - Running info published to the App Group
+    //
+    // Written on a timer rather than answered on request. The dashboard asked over
+    // sendProviderMessage and got nil every time, while the identical call works in here --
+    // the routes it installs are built from it. Two things could explain that nil: the message
+    // never arrives, or the reply is past whatever size that channel carries (a 40 KB one came
+    // back nil earlier in this work). Publishing does not depend on knowing which, and if the
+    // messages never arrive then answering on request could not work by definition.
+    //
+    // On a timer and not from the core's changed-callback because that fires on peer and route
+    // changes, and a dashboard also shows counters that move without either.
+    private static let runningInfoInterval: TimeInterval = 2
+    private var runningInfoTimer: DispatchSourceTimer?
+    private var runningInfoWrites = 0
+    private var runningInfoFailure: String?
+
+    private func startRunningInfoPublisher() {
+        stopRunningInfoPublisher()
+        guard let container = FileManager.default.containerURL(
+            forSecurityApplicationGroupIdentifier: APP_GROUP_ID
+        ) else {
+            dlog("running info publisher: no App Group container for \(APP_GROUP_ID)")
+            return
+        }
+        let url = container.appendingPathComponent(RUNNING_INFO_FILENAME)
+        let timer = DispatchSource.makeTimerSource(queue: settingsQueue)
+        timer.schedule(
+            deadline: .now(),
+            repeating: PacketTunnelProvider.runningInfoInterval
+        )
+        timer.setEventHandler { [weak self] in self?.publishRunningInfo(to: url) }
+        timer.resume()
+        runningInfoTimer = timer
+        dlog("running info publisher every \(PacketTunnelProvider.runningInfoInterval)s to \(url.path)")
+    }
+
+    private func stopRunningInfoPublisher() {
+        runningInfoTimer?.cancel()
+        runningInfoTimer = nil
+        runningInfoWrites = 0
+        runningInfoFailure = nil
+    }
+
+    private func publishRunningInfo(to url: URL) {
+        var infoPtr: UnsafePointer<CChar>? = nil
+        var errPtr: UnsafePointer<CChar>? = nil
+        guard get_running_info(&infoPtr, &errPtr) == 0,
+              let info = extractRustString(infoPtr),
+              let data = info.data(using: .utf8) else {
+            noteRunningInfoFailure(extractRustString(errPtr) ?? "get_running_info gave nothing")
+            return
+        }
+        do {
+            // Atomic, because the app reads this file on its own schedule and a partial read
+            // would look like corrupt data rather than a timing problem.
+            try data.write(to: url, options: .atomic)
+            runningInfoWrites += 1
+            // The first write, then sparsely: what is worth knowing is that it started and
+            // that it is still going, not each of the thousands in between.
+            if runningInfoWrites == 1 || runningInfoWrites % 150 == 0 {
+                dlog("running info published #\(runningInfoWrites), \(data.count) bytes")
+            }
+        } catch {
+            noteRunningInfoFailure("write failed: \(error.localizedDescription)")
+        }
+    }
+
+    /// Only when the reason changes, since this runs every couple of seconds and a permanent
+    /// failure would otherwise say the same thing until the buffer held nothing else.
+    private func noteRunningInfoFailure(_ reason: String) {
+        guard runningInfoFailure != reason else { return }
+        runningInfoFailure = reason
+        dlog("running info publish failed: \(reason)")
+    }
     
     private func registerRustStopCallback() {
         // Register FFI stop callback to capture crashes/stop events
@@ -1290,6 +1370,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                     self.startTelemetry()
                     self.startRustLogTail()
                     self.startMemoryProbe()
+                    self.startRunningInfoPublisher()
                     // startDiagnosticsUpload() stays off: it is built on URLSession, which
                     // is the one API with no way to be pinned to the tunnel, so it cannot
                     // reach an overlay address from here however it is configured. The
@@ -1309,6 +1390,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             self.finishStress()
             self.stopDiagnosticsUpload()
             self.stopRustLogTail()
+            self.stopRunningInfoPublisher()
             self.stopMemoryProbe()
             self.closeTelemetry()
             self.tunnelGeneration &+= 1
