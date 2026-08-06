@@ -57,7 +57,7 @@ final class DiagnosticsLog {
 /// Bumped by hand on every diagnostics change, so an exported log always states
 /// which build produced it. Comparing bundle versions is not enough: the CI hands
 /// out the same version string for every commit.
-let DIAG_BUILD = "diag-8 (ready-gated telemetry, switchable; exit node adds a default route)"
+let DIAG_BUILD = "diag-9 (drop incomplete port forwards that made the config unparseable)"
 
 /// Log to OSLog and to the retrievable buffer at once.
 ///

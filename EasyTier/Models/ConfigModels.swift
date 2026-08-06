@@ -304,11 +304,25 @@ nonisolated struct NetworkConfig: Codable {
             )
         })
 
-        self.portForward = emptyAsNil(profile.portForwards.map {
-            PortForwardConfig(
-                bindAddr: "\($0.bindAddr):\($0.bindPort)",
-                dstAddr: "\($0.destAddr):\($0.destPort)",
-                proto: $0.proto,
+        self.portForward = emptyAsNil(profile.portForwards.compactMap { item in
+            // Incomplete rows are dropped, the way every list above drops them. A row the
+            // editor created but nobody filled in has empty addresses and zero ports, which
+            // serialises to ":0" -- not a socket address the core accepts. And it does not
+            // fail in isolation: one of them makes the entire config unparseable, so the
+            // tunnel refuses to start and the reason names a port forward the user never
+            // meant to add.
+            guard !item.bindAddr.isEmpty, !item.destAddr.isEmpty,
+                  (1...65535).contains(item.bindPort),
+                  (1...65535).contains(item.destPort) else { return nil }
+            // A bare IPv6 address needs brackets before a port can be appended, or the
+            // colons run together into something no parser can read.
+            let withPort = { (addr: String, port: Int) in
+                addr.contains(":") ? "[\(addr)]:\(port)" : "\(addr):\(port)"
+            }
+            return PortForwardConfig(
+                bindAddr: withPort(item.bindAddr, item.bindPort),
+                dstAddr: withPort(item.destAddr, item.destPort),
+                proto: item.proto,
             )
         })
 
