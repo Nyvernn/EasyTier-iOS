@@ -777,10 +777,19 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     // attempt loaded the whole file to take a tail of it, which in a process capped near
     // 46 MiB against a log that reaches megabytes in minutes was fatal on its own.
     private static let rustLogTailInterval: TimeInterval = 5
-    private static let rustLogTailChunk = 16 * 1024
+    /// Read in slices this size so peak memory stays flat however far behind the tail is.
+    private static let rustLogTailChunk = 64 * 1024
+    /// How much may be *read* per tick, across as many slices as that takes. Far above what
+    /// is sent, and deliberately so: the core writes around 23 KB/s, and reading at the rate
+    /// it is sent left the tail permanently behind -- skipping a quarter of a megabyte every
+    /// tick, indiscriminately, so the lines that survived were an arbitrary 5% rather than
+    /// the interesting ones. What costs anything here is the wire, and the filter below is
+    /// what keeps that small; reading is cheap and is what decides the filter ever sees a
+    /// line at all.
+    private static let rustLogTailBudget = 512 * 1024
     /// Past this far behind, skip forward rather than stay behind forever: a permanent lag
     /// means everything arriving is stale, which is worse than a gap that says so.
-    private static let rustLogTailMaxBacklog = 256 * 1024
+    private static let rustLogTailMaxBacklog = 2 * 1024 * 1024
     /// One line per forwarded packet, and 96% of everything the tail produced in its first
     /// run: 16552 lines out of 17312. Left in, it buries every other line in the stream and
     /// adds steady traffic to a link whose memory leak scales with exactly that. Matched as a
@@ -834,39 +843,51 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             if end < rustLogTailOffset { rustLogTailOffset = 0 }
             guard end > rustLogTailOffset else { return }
             if end - rustLogTailOffset > UInt64(PacketTunnelProvider.rustLogTailMaxBacklog) {
-                let skipped = end - rustLogTailOffset - UInt64(PacketTunnelProvider.rustLogTailChunk)
-                rustLogTailOffset = end - UInt64(PacketTunnelProvider.rustLogTailChunk)
+                // Forward to within one tick's reading, so the catching up finishes on this
+                // tick rather than trailing the truth for however long the backlog lasts.
+                let keep = UInt64(PacketTunnelProvider.rustLogTailBudget)
+                let skipped = end - rustLogTailOffset - keep
+                rustLogTailOffset = end - keep
                 dlog("rust log tail fell behind, skipped \(skipped) bytes")
             }
-            let start = rustLogTailOffset
-            try handle.seek(toOffset: start)
-            let want = Int(min(end - start, UInt64(PacketTunnelProvider.rustLogTailChunk)))
-            guard let raw = try handle.read(upToCount: want), !raw.isEmpty else { return }
-            // Re-wrapped so the indices start at zero: Data subsequences keep the parent's,
-            // and the newline search below would otherwise be off by that offset.
-            let chunk = Data(raw)
-            let usable: Data
-            if let lastBreak = chunk.lastIndex(of: 0x0A) {
-                // Only up to the last newline, so a line is never split across two
-                // datagrams; the remainder is picked up on the next tick.
-                usable = chunk.prefix(upTo: lastBreak)
-                rustLogTailOffset = start + UInt64(lastBreak) + 1
-            } else {
-                // A chunk with no newline in it at all means one line longer than the chunk
-                // size. Consume it anyway: returning here would re-read the same bytes every
-                // tick and the tail would never move again.
-                usable = chunk
-                rustLogTailOffset = start + UInt64(chunk.count)
-            }
+            var budget = PacketTunnelProvider.rustLogTailBudget
             var suppressed = 0
-            for raw in String(decoding: usable, as: UTF8.self)
-                .split(separator: "\n", omittingEmptySubsequences: true) {
-                let line = String(raw)
-                if PacketTunnelProvider.rustLogNoise.contains(where: { line.range(of: $0) != nil }) {
-                    suppressed += 1
-                    continue
+            while budget > 0, rustLogTailOffset < end {
+                let start = rustLogTailOffset
+                try handle.seek(toOffset: start)
+                let want = Int(min(
+                    min(end - start, UInt64(PacketTunnelProvider.rustLogTailChunk)),
+                    UInt64(budget)
+                ))
+                guard let raw = try handle.read(upToCount: want), !raw.isEmpty else { break }
+                // Re-wrapped so the indices start at zero: Data subsequences keep the parent's,
+                // and the newline search below would otherwise be off by that offset.
+                let chunk = Data(raw)
+                budget -= chunk.count
+                let usable: Data
+                if let lastBreak = chunk.lastIndex(of: 0x0A) {
+                    // Only up to the last newline, so a line is never split across two
+                    // datagrams; the remainder is picked up on the next pass.
+                    usable = chunk.prefix(upTo: lastBreak)
+                    rustLogTailOffset = start + UInt64(lastBreak) + 1
+                } else {
+                    // A slice with no newline in it at all means one line longer than the
+                    // slice. Consume it anyway: returning here would re-read the same bytes
+                    // every tick and the tail would never move again.
+                    usable = chunk
+                    rustLogTailOffset = start + UInt64(chunk.count)
                 }
-                transmit("RUST " + line, over: conn)
+                for rawLine in String(decoding: usable, as: UTF8.self)
+                    .split(separator: "\n", omittingEmptySubsequences: true) {
+                    let line = String(rawLine)
+                    if PacketTunnelProvider.rustLogNoise.contains(
+                        where: { line.range(of: $0) != nil }
+                    ) {
+                        suppressed += 1
+                        continue
+                    }
+                    transmit("RUST " + line, over: conn)
+                }
             }
             // Said out loud rather than dropped quietly: a filtered stream that does not
             // admit to filtering reads as the whole log, and the count is also the cheapest
