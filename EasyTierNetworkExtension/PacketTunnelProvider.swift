@@ -28,15 +28,26 @@ final class DiagnosticsLog {
     /// interesting part of a startup problem is always the first minute, which fits several
     /// times over.
     private let limit = 400
-    private let startedAt = Date()
+    private var startedAt = Date()
 
     func append(_ message: String) {
-        let elapsed = String(format: "%8.2f", Date().timeIntervalSince(startedAt))
         lock.lock()
+        let elapsed = String(format: "%8.2f", Date().timeIntervalSince(startedAt))
         lines.append("[\(elapsed)] \(message)")
         if lines.count > limit {
             lines.removeFirst(lines.count - limit)
         }
+        lock.unlock()
+    }
+
+    /// Emptied at the top of every tunnel session, because this process outlives the sessions
+    /// it serves. Without this the replay of a second session would re-send the first one --
+    /// the same startup twice, and the elapsed times counted from a process start that could
+    /// be hours back, which reads as if the tunnel had taken hours to come up.
+    func reset() {
+        lock.lock()
+        lines.removeAll()
+        startedAt = Date()
         lock.unlock()
     }
 
@@ -53,11 +64,6 @@ final class DiagnosticsLog {
             + snapshot.joined(separator: "\n")
     }
 }
-
-/// Bumped by hand on every diagnostics change, so an exported log always states
-/// which build produced it. Comparing bundle versions is not enough: the CI hands
-/// out the same version string for every commit.
-let DIAG_BUILD = "diag-9 (the rust log streams out too, incrementally)"
 
 /// Log to OSLog and to the retrievable buffer at once.
 ///
@@ -668,7 +674,14 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     /// precisely the part worth having: the options, the resolved App Group, the routes
     /// themselves. Those lines are still in the buffer, so they are replayed here.
     private func startTelemetry() {
-        guard telemetryConnection == nil else { return }
+        // Always a new connection, never a surviving one. This process outlives a tunnel
+        // session -- iOS restarts the tunnel on a network change without calling stopTunnel --
+        // and a connection carried over is pinned to the previous utun, which no longer
+        // exists, while `telemetryReplayed` is still set. That is the state that swallowed
+        // every startup replay after the first: the wire looked open, so nothing reported a
+        // failure, and the only lines that arrived were the ones written late enough for a
+        // new utun to have taken the old one's name.
+        closeTelemetry()
         // Nothing is opened when it is switched off, so `sendTelemetry` finds no connection
         // and every line stops at the in-process buffer. One check, one place.
         guard isTelemetryEnabled() else {
@@ -717,11 +730,15 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     private func replayBufferedTelemetry() {
         guard !telemetryReplayed, let conn = telemetryConnection else { return }
         telemetryReplayed = true
-        for line in DiagnosticsLog.shared.dump().split(
+        let lines = DiagnosticsLog.shared.dump().split(
             separator: "\n", omittingEmptySubsequences: false
-        ) {
+        )
+        for line in lines {
             transmit(String(line), over: conn)
         }
+        // Last, and states its own count, so the sink can tell "the replay never ran" from
+        // "the replay ran and its datagrams were dropped" without another build to find out.
+        transmit("telemetry replayed \(lines.count) lines", over: conn)
     }
 
     /// Never calls `dlog`, at any depth: it is called *from* dlog, so that would recurse
@@ -769,7 +786,11 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     private var rustLogTailOffset: UInt64 = 0
 
     private func startRustLogTail() {
-        guard rustLogTailTimer == nil, isTelemetryEnabled() else { return }
+        // Reopened per session for the same reason the telemetry connection is: the core
+        // reopens its log in initRustLogger, so a handle carried over from the previous
+        // session can be holding a file nobody writes to any more.
+        stopRustLogTail()
+        guard isTelemetryEnabled() else { return }
         guard let path = rustLogPath, let handle = FileHandle(forReadingAtPath: path) else {
             dlog("rust log tail: cannot open \(rustLogPath ?? "nil")")
             return
@@ -1159,6 +1180,9 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             self.activeTunnelGeneration = generation
             self.pendingStartCompletion = .init(generation: generation, completion: completion)
             PacketTunnelProvider.current = self
+            // Ahead of the first dlog below, so the buffer this session's replay sends holds
+            // this session and nothing else.
+            DiagnosticsLog.shared.reset()
 
             guard let options = self.loadOptions() else {
                 // Both channels came up empty. Note this point is still ahead of

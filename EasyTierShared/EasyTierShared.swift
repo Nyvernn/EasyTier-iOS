@@ -63,6 +63,15 @@ public let APP_GROUP_SOURCE: String = resolvedAppGroup.source
 /// SwiftUI body would otherwise put a syscall on the main thread per render.
 public let APP_GROUP_AVAILABLE: Bool = resolvedAppGroup.available
 
+/// Bumped by hand on every diagnostics change, so a report always states which build
+/// produced it. Comparing bundle versions is not enough: the CI hands out the same version
+/// string for every commit.
+///
+/// Shared rather than per-target so the app and the extension cannot disagree about which
+/// build is running -- they are installed together, and a report from one is read alongside
+/// the other's.
+public let DIAG_BUILD: String = "diag-10 (telemetry survives a reconnect; the app's own line gets out)"
+
 /// Whether the diagnostic telemetry stream is on.
 ///
 /// Lives in the shared defaults so the app and the extension agree on it and so flipping the

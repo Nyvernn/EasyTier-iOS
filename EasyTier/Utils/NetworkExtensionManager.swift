@@ -40,11 +40,18 @@ final class AppTelemetry {
     /// The oldest go first: a stale outcome is worth less than the current one.
     private static let backlogLimit = 200
 
+    /// Retried rather than abandoned, because `sendOnce` gives each line one chance: nothing
+    /// re-triggers a line whose connection was not up when it was written. Bounded so an
+    /// unreachable sink costs a fixed number of attempts instead of retrying for the session.
+    private static let reopenDelay: TimeInterval = 3
+    private static let reopenLimit = 10
+
     private let queue = DispatchQueue(label: "\(APP_BUNDLE_ID).app.telemetry")
     private var connection: NWConnection?
     private var isReady = false
     private var backlog: [String] = []
     private var lastByKey: [String: String] = [:]
+    private var reopenCount = 0
 
     /// Tagged APP so a reader can tell these apart from the extension's own lines in a log
     /// both processes write to.
@@ -81,25 +88,49 @@ final class AppTelemetry {
     /// was started on it. So none of this needs further synchronisation.
     private func openConnection() {
         let conn = NWConnection(to: Self.target, using: .udp)
-        conn.stateUpdateHandler = { [weak self] state in
-            guard let self else { return }
+        // Both weak, and checked against the current connection: a cancelled connection keeps
+        // reporting for a while after being let go of, and without the identity check that
+        // late `.cancelled` would tear down whichever connection had replaced it in the
+        // meantime -- once per reopen, forever. Weak on `conn` also keeps the connection from
+        // retaining the handler that holds it.
+        conn.stateUpdateHandler = { [weak self, weak conn] state in
+            guard let self, let conn, self.connection === conn else { return }
             switch state {
             case .ready:
                 self.isReady = true
+                self.reopenCount = 0
                 self.flush()
-            case .failed, .cancelled:
-                // Cancelled and released rather than retried: the next send opens a fresh
-                // one, and by then the tunnel may exist where it did not before. Cancelling
-                // is what lets the framework let go of it.
-                self.isReady = false
-                self.connection?.cancel()
-                self.connection = nil
+            case .waiting, .failed, .cancelled:
+                // All three end the same way: let go of this one and open another shortly,
+                // by which time the tunnel may exist where it did not. `.waiting` is included
+                // because the framework's own retry watches the physical path, and the path
+                // this needs is a tunnel that comes up seconds later; a connection parked
+                // there reports no failure, so nothing else would notice.
+                self.reopen()
             default:
                 break
             }
         }
-        conn.start(queue: queue)
+        // Current before started, so the identity check above cannot reject the very first
+        // state update this connection reports.
         connection = conn
+        conn.start(queue: queue)
+    }
+
+    /// Dropped and retried rather than cancelled in place: cancelling is what makes the
+    /// framework let go, and a fresh connection is what picks up a route that did not exist
+    /// when the last one was opened.
+    private func reopen() {
+        guard let current = connection else { return }
+        isReady = false
+        connection = nil
+        current.cancel()
+        guard !backlog.isEmpty, reopenCount < Self.reopenLimit else { return }
+        reopenCount += 1
+        queue.asyncAfter(deadline: .now() + Self.reopenDelay) { [self] in
+            guard connection == nil, !backlog.isEmpty else { return }
+            openConnection()
+        }
     }
 
     private func flush() {
@@ -195,6 +226,13 @@ class NetworkExtensionManager: NetworkExtensionManagerProtocol {
                     self.connectedDate = self.connection?.connectedDate
                     if self.status == .invalid {
                         self.manager = nil
+                    }
+                    if self.status == .connected {
+                        // Tied to the tunnel coming up rather than to app launch, because
+                        // before that there is no route to the sink at all. Its only job is to
+                        // separate "the app cannot reach the sink" from "the dashboard never
+                        // asks": without it, one silent log means both and neither.
+                        AppTelemetry.shared.sendOnce(key: "app", "build=\(DIAG_BUILD)")
                     }
                     
                     // Sync VPN connection status to App Group for Control Widget
