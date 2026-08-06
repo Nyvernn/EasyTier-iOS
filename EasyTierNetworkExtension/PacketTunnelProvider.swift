@@ -57,7 +57,7 @@ final class DiagnosticsLog {
 /// Bumped by hand on every diagnostics change, so an exported log always states
 /// which build produced it. Comparing bundle versions is not enough: the CI hands
 /// out the same version string for every commit.
-let DIAG_BUILD = "diag-9 (drop incomplete port forwards that made the config unparseable)"
+let DIAG_BUILD = "diag-9 (the rust log streams out too, incrementally)"
 
 /// Log to OSLog and to the retrievable buffer at once.
 ///
@@ -749,6 +749,97 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         })
     }
 
+    // MARK: - Rust log streaming
+    //
+    // The core writes far more than the Swift side ever will -- which peer answered, which
+    // route arrived, why a connection failed -- and none of it passes through dlog, so none
+    // of it reached the sink. That gap is the only reason diagnosis kept ending in "send me
+    // the log file".
+    //
+    // Read incrementally from a remembered offset, a bounded slice per tick. An earlier
+    // attempt loaded the whole file to take a tail of it, which in a process capped near
+    // 46 MiB against a log that reaches megabytes in minutes was fatal on its own.
+    private static let rustLogTailInterval: TimeInterval = 5
+    private static let rustLogTailChunk = 16 * 1024
+    /// Past this far behind, skip forward rather than stay behind forever: a permanent lag
+    /// means everything arriving is stale, which is worse than a gap that says so.
+    private static let rustLogTailMaxBacklog = 256 * 1024
+    private var rustLogTailTimer: DispatchSourceTimer?
+    private var rustLogTailHandle: FileHandle?
+    private var rustLogTailOffset: UInt64 = 0
+
+    private func startRustLogTail() {
+        guard rustLogTailTimer == nil, isTelemetryEnabled() else { return }
+        guard let path = rustLogPath, let handle = FileHandle(forReadingAtPath: path) else {
+            dlog("rust log tail: cannot open \(rustLogPath ?? "nil")")
+            return
+        }
+        rustLogTailHandle = handle
+        // From the current end. What came before is already covered by the buffer replay,
+        // and re-sending a file that may be large is the thing being avoided here.
+        rustLogTailOffset = (try? handle.seekToEnd()) ?? 0
+        let timer = DispatchSource.makeTimerSource(queue: settingsQueue)
+        timer.schedule(
+            deadline: .now() + PacketTunnelProvider.rustLogTailInterval,
+            repeating: PacketTunnelProvider.rustLogTailInterval
+        )
+        timer.setEventHandler { [weak self] in self?.pumpRustLogTail() }
+        timer.resume()
+        rustLogTailTimer = timer
+        dlog("rust log tail started at offset \(rustLogTailOffset) of \(path)")
+    }
+
+    private func stopRustLogTail() {
+        rustLogTailTimer?.cancel()
+        rustLogTailTimer = nil
+        try? rustLogTailHandle?.close()
+        rustLogTailHandle = nil
+        rustLogTailOffset = 0
+    }
+
+    private func pumpRustLogTail() {
+        guard let handle = rustLogTailHandle, let conn = telemetryConnection else { return }
+        do {
+            let end = try handle.seekToEnd()
+            // The appender truncates when the log is cleared, so a file shorter than last
+            // time means the offset points past data that no longer exists.
+            if end < rustLogTailOffset { rustLogTailOffset = 0 }
+            guard end > rustLogTailOffset else { return }
+            if end - rustLogTailOffset > UInt64(PacketTunnelProvider.rustLogTailMaxBacklog) {
+                let skipped = end - rustLogTailOffset - UInt64(PacketTunnelProvider.rustLogTailChunk)
+                rustLogTailOffset = end - UInt64(PacketTunnelProvider.rustLogTailChunk)
+                dlog("rust log tail fell behind, skipped \(skipped) bytes")
+            }
+            let start = rustLogTailOffset
+            try handle.seek(toOffset: start)
+            let want = Int(min(end - start, UInt64(PacketTunnelProvider.rustLogTailChunk)))
+            guard let raw = try handle.read(upToCount: want), !raw.isEmpty else { return }
+            // Re-wrapped so the indices start at zero: Data subsequences keep the parent's,
+            // and the newline search below would otherwise be off by that offset.
+            let chunk = Data(raw)
+            let usable: Data
+            if let lastBreak = chunk.lastIndex(of: 0x0A) {
+                // Only up to the last newline, so a line is never split across two
+                // datagrams; the remainder is picked up on the next tick.
+                usable = chunk.prefix(upTo: lastBreak)
+                rustLogTailOffset = start + UInt64(lastBreak) + 1
+            } else {
+                // A chunk with no newline in it at all means one line longer than the chunk
+                // size. Consume it anyway: returning here would re-read the same bytes every
+                // tick and the tail would never move again.
+                usable = chunk
+                rustLogTailOffset = start + UInt64(chunk.count)
+            }
+            for line in String(decoding: usable, as: UTF8.self)
+                .split(separator: "\n", omittingEmptySubsequences: true) {
+                transmit("RUST " + line, over: conn)
+            }
+        } catch {
+            dlog("rust log tail read failed: \(error)")
+            stopRustLogTail()
+        }
+    }
+
     private func closeTelemetry() {
         telemetryConnection?.cancel()
         telemetryConnection = nil
@@ -1120,6 +1211,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                             + " an overlay address")
                     }
                     self.startTelemetry()
+                    self.startRustLogTail()
                     self.startMemoryProbe()
                     // startDiagnosticsUpload() stays off: it is built on URLSession, which
                     // is the one API with no way to be pinned to the tunnel, so it cannot
@@ -1139,6 +1231,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         settingsQueue.async {
             self.finishStress()
             self.stopDiagnosticsUpload()
+            self.stopRustLogTail()
             self.stopMemoryProbe()
             self.closeTelemetry()
             self.tunnelGeneration &+= 1
